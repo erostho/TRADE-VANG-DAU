@@ -166,9 +166,10 @@ def send_tele(text: str):
     if not BOT_TOKEN or not CHAT_ID:
         return
     try:
+        full_message = "💵 TRADE GOODS\n" + text
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text},
+            json={"chat_id": CHAT_ID, "text": full_message},
             timeout=20
         )
     except Exception as e:
