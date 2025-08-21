@@ -177,10 +177,11 @@ def send_tele(text: str):
 # ---------- Main ----------
 def main():
     reports = []
+    any_signal = False  # có ít nhất 1 LONG/SHORT?
+
     for display, base_symbol in ASSETS.items():
         logging.info(f"=== Start {display} ({base_symbol}) ===")
         notes = []
-        # fallback riêng cho dầu
         sym_candidates = [base_symbol] if base_symbol != "CL" else ["CL", "WTI/USD"]
 
         frames = {}
@@ -192,7 +193,6 @@ def main():
                     break
                 except Exception as e:
                     logging.warning(f"Try {sym} {iv} fail: {e}")
-                    last_err = str(e)
             frames[lbl] = df
             if df is None:
                 notes.append(f"{lbl} ERR")
@@ -213,12 +213,17 @@ def main():
         line_mid   = s2h if (s2h == s4h and s2h != "N/A") else f"Mixed (2H:{s2h}, 4H:{s4h})"
         msg = f"==={display}===\n30m-1H: {line_short}\n2H-4H: {line_mid}\n1D: {s1d}"
 
-        if INC_ERR_TG and notes:
-            msg += f"\n⚠ thiếu dữ liệu: {', '.join(notes)}"
-        logging.info(msg.replace("\n", " | "))
-        reports.append(msg)
+        # chỉ add nếu có LONG/SHORT ở bất kỳ khung nào
+        if any(x in ("LONG", "SHORT") for x in [s30, s1h, s2h, s4h, s1d]):
+            reports.append(msg)
+            any_signal = True
+        else:
+            logging.info(f"{display}: all SIDEWAY/N/A -> skip Telegram")
 
-    send_tele("\n\n".join(reports))
+    if any_signal:
+        send_tele("\n\n".join(reports))
+    else:
+        logging.info("No trade signals (LONG/SHORT). Telegram not sent.")
 
 if __name__ == "__main__":
     main()
