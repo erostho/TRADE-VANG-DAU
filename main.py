@@ -36,8 +36,8 @@ ADX_TREND = 20
 RR_MIN = 1.5
 
 # Telegram config (điền bot token + chat id của bạn)
-BOT_TOKEN = os.getenv("TELE_BOT_TOKEN")
-CHAT_ID   = os.getenv("TELE_CHAT_ID")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
 # ========= INDICATORS =========
 def ema(series, n): return series.ewm(span=n, adjust=False).mean()
