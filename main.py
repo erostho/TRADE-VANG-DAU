@@ -1,34 +1,48 @@
 # -*- coding: utf-8 -*-
 """
-Scanner Yahoo Finance
-Khung: 30m, 1H (native), 3H (resample từ 1H), 1D (native)
-Tài sản: XAU/USD, WTI Oil, BTC, EUR/USD, USD/JPY
+Scanner (Yahoo Finance)
+Frames: 30m, 1H, 1D
+Symbols chuẩn:
+  - Gold (GC=F), WTI (CL=F), Bitcoin (BTC-USD), EUR/USD (EURUSD=X), USD/JPY (JPY=X)
 Logic: EMA20/50/200 + RSI14 + MACD + ADX + BBWidth
-Kết quả: LONG / SHORT / SIDEWAY
+Output per symbol to Telegram:
+===SYMBOL===
+30m-1H: <status or Mixed(...)>
+1H: <status>
+1D: <status>
+
 ENV: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 """
 
-import os, numpy as np, pandas as pd, yfinance as yf, requests
+import os
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import requests
 
-# -------- Config --------
+# ---------- CONFIG ----------
 ASSETS = {
-    "XAU/USD": {"intraday": ["XAUUSD=X", "GC=F"], "daily": ["XAUUSD=X", "GC=F"]},
-    "WTI Oil": {"intraday": ["CL=F"],                 "daily": ["CL=F"]},
-    "Bitcoin": {"intraday": ["BTC-USD"],              "daily": ["BTC-USD"]},
-    "EUR/USD": {"intraday": ["EURUSD=X"],             "daily": ["EURUSD=X"]},
-    "USD/JPY": {"intraday": ["JPY=X"],                "daily": ["JPY=X"]},
+    "XAU/USD (Gold)": "GC=F",
+    "WTI Oil": "CL=F",
+    "Bitcoin": "BTC-USD",
+    "EUR/USD": "EURUSD=X",
+    "USD/JPY": "JPY=X",
 }
-ADX_TREND = 20
+
+# khung dùng trực tiếp từ Yahoo
+INTRADAY_PERIOD = "60d"  # giới hạn intraday của Yahoo
+ADX_TREND = 20           # lọc sideway
 SEND_TELE = True
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 
-# -------- Indicators --------
+# ---------- INDICATORS ----------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rsi(close, n=14):
-    delta = close.diff()
-    gain, loss = delta.clip(lower=0), (-delta).clip(lower=0)
+    d = close.diff()
+    gain, loss = d.clip(lower=0), (-d).clip(lower=0)
     ag = gain.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
     al = loss.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
     rs = ag / al.replace(0, np.nan)
@@ -60,31 +74,6 @@ def bb_width(close, n=20):
     sd = close.rolling(n).std(ddof=0)
     return ((ma + 2*sd) - (ma - 2*sd)) / ma
 
-# -------- Yahoo helpers --------
-def fetch_yf(tickers, interval, period):
-    last_err = None
-    for t in tickers:
-        try:
-            df = yf.download(t, interval=interval, period=period,
-                             auto_adjust=False, progress=False)
-            if isinstance(df, pd.DataFrame) and not df.empty and {"Open","High","Low","Close"}.issubset(df.columns):
-                df = df.dropna().copy()
-                df.index = pd.to_datetime(df.index)
-                return df, t
-        except Exception as e:
-            last_err = e
-    raise last_err or RuntimeError(f"No data for {tickers} @ {interval}/{period}")
-
-def resample_ohlc(df, rule):
-    o = df["Open"].resample(rule).first()
-    h = df["High"].resample(rule).max()
-    l = df["Low"].resample(rule).min()
-    c = df["Close"].resample(rule).last()
-    v = df.get("Volume", pd.Series(index=df.index, dtype=float)).resample(rule).sum()
-    out = pd.DataFrame({"Open": o, "High": h, "Low": l, "Close": c, "Volume": v}).dropna()
-    return out
-
-# -------- Core analysis --------
 def decorate(df):
     out = df.copy()
     out["EMA20"]  = ema(out["Close"], 20)
@@ -104,58 +93,73 @@ def decide(df):
         and last["RSI14"] > 55
         and last["MACD"] > last["MACD_SIG"]
         and trending):
-        return "LONG"
+        return "Long".upper()
     if (last["Close"] < last["EMA20"] < last["EMA50"] < last["EMA200"]
         and last["RSI14"] < 45
         and last["MACD"] < last["MACD_SIG"]
         and trending):
-        return "SHORT"
-    return "SIDEWAY"
+        return "Short".upper()
+    return "Sideway".upper()
 
-def analyze_asset(name, mapping):
-    # 30m & 1H (<=60d)
-    df30, _ = fetch_yf(mapping["intraday"], "30m", "60d")
-    df1h,  _ = fetch_yf(mapping["intraday"], "1h",  "60d")
-    # 3H: resample từ 1H
-    df3h = resample_ohlc(df1h, "3H")
-    # 1D: 5y
-    df1d, _ = fetch_yf(mapping["daily"], "1d", "5y")
+# ---------- DATA ----------
+def fetch(symbol, interval, period):
+    df = yf.download(symbol, interval=interval, period=period,
+                     auto_adjust=False, progress=False)
+    if df is None or df.empty or not {"Open","High","Low","Close"}.issubset(df.columns):
+        raise RuntimeError(f"No data for {symbol} @ {interval}/{period}")
+    df = df.dropna().copy()
+    df.index = pd.to_datetime(df.index)
+    return df
 
-    frames = {
-        "30m": df30, "1H": df1h, "3H": df3h, "1D": df1d
-    }
-    results = {k: (decide(decorate(v)) if len(v) >= 100 else "N/A")
-               for k, v in frames.items()}
-
-    msg = (
-        f"====== {name} ======\n"
-        f"30m-1H: {results['30m']} / {results['1H']}\n"
-        f"1H: {results['1H']}"
-        f"1D: {results['1D']}\n"
-    )
-    print(msg)
-    return msg
-
-# -------- Telegram --------
+# ---------- TELEGRAM ----------
 def send_tele(text):
     if not SEND_TELE: return
     if not BOT_TOKEN or not CHAT_ID:
         print("⚠️ Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID"); return
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text}, timeout=20)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text},
+            timeout=20
+        )
     except Exception as e:
         print("Telegram error:", e)
 
-# -------- Main --------
+# ---------- ANALYZE ONE ----------
+def analyze_one(name, ticker):
+    # 30m & 1h (<=60d), 1d (5y)
+    d30 = decorate(fetch(ticker, "30m", INTRADAY_PERIOD))
+    d1h = decorate(fetch(ticker, "1h",  INTRADAY_PERIOD))
+    d1d = decorate(fetch(ticker, "1d",  "5y"))
+
+    s30 = decide(d30) if len(d30) >= 100 else "N/A"
+    s1h = decide(d1h) if len(d1h) >= 100 else "N/A"
+    s1d = decide(d1d) if len(d1d) >= 200 else "N/A"
+
+    # tổng hợp short-term (30m-1H)
+    if s30 == s1h and s30 not in ("N/A",):
+        short_line = s30
+    else:
+        short_line = f"Mixed (30m:{s30}, 1H:{s1h})"
+
+    msg = (
+        f"==={name}===\n"
+        f"30m-1H: {short_line}\n"
+        f"1H: {s1h}\n"
+        f"1D: {s1d}"
+    )
+    print(msg)
+    return msg
+
+# ---------- MAIN ----------
 def main():
-    all_msgs = []
-    for name, mapping in ASSETS.items():
+    reports = []
+    for name, ticker in ASSETS.items():
         try:
-            all_msgs.append(analyze_asset(name, mapping))
+            reports.append(analyze_one(name, ticker))
         except Exception as e:
-            all_msgs.append(f"====== {name} ======\nLỗi: {e}")
-    send_tele("\n\n".join(all_msgs))
+            reports.append(f"==={name}===\nLỗi: {e}")
+    send_tele("\n\n".join(reports))
 
 if __name__ == "__main__":
     main()
