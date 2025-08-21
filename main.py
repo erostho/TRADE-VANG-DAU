@@ -1,41 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-Frames: 30m, 1H, 1D
-Symbols: GC=F (Gold futures), CL=F (WTI), BTC-USD, EURUSD=X, JPY=X
+Only-TwelveData Scanner
+Frames: 30m, 1H, 2H, 4H, 1D
+Assets:
+  - XAU/USD (Gold)  -> XAU/USD
+  - WTI Oil         -> CL (continuous)
+  - Bitcoin         -> BTC/USD
+  - EUR/USD         -> EUR/USD
+  - USD/JPY         -> USD/JPY
 Logic: EMA20/50/200 + RSI14 + MACD + ADX + BBWidth
-Yahoo (yfinance) -> nếu fail vì bị chặn IP/404 -> fallback TwelveData (nếu có TWELVE_DATA_KEY)
-ENV:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  LOG_LEVEL=INFO/DEBUG (optional)
-  INCLUDE_ERRORS_IN_TELEGRAM=1 (optional)
-  TWELVE_DATA_KEY=<your_key> (optional)
+Telegram format:
+===SYMBOL===
+30m-1H: <Sideway/Mixed/...>
+2H-4H: <Long/Short/Sideway or Mixed(...)>
+1D: <Long/Short/Sideway>
+
+ENV REQUIRED:
+  TWELVE_DATA_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Optional:
+  LOG_LEVEL=INFO|DEBUG
+  INCLUDE_ERRORS_IN_TELEGRAM=1
 """
 
-import os, logging, requests
-import numpy as np
+import os
+import logging
+import requests
 import pandas as pd
-import yfinance as yf
+import numpy as np
 
-# ---------- CONFIG ----------
-ASSETS = {
-    "XAU/USD (Gold)": "GC=F",
-    "WTI Oil": "CL=F",
-    "Bitcoin": "BTC-USD",
-    "EUR/USD": "EURUSD=X",
-    "USD/JPY": "JPY=X",
-}
-
-INTRADAY_PERIODS = ["60d", "30d", "14d", "7d", "5d", "2d", "1d"]
-DAILY_PERIODS    = ["5y", "3y", "1y"]
-
-ADX_TREND = 20
-SEND_TELE = True
-
+# ----------- ENV / LOG -----------
+TD_KEY = os.getenv("TWELVE_DATA_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
-TD_KEY    = os.getenv("TWELVE_DATA_KEY")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 INC_ERR_TG = os.getenv("INCLUDE_ERRORS_IN_TELEGRAM", "0") == "1"
+
+if not TD_KEY:
+    raise SystemExit("❌ Missing TWELVE_DATA_KEY env.")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -43,7 +44,30 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# ---------- COMMON INDICATORS ----------
+# ----------- CONFIG -----------
+ASSETS = {
+    "XAU/USD (Gold)": "XAU/USD",
+    "WTI Oil": "CL",            # WTI continuous
+    "Bitcoin": "BTC/USD",
+    "EUR/USD": "EUR/USD",
+    "USD/JPY": "USD/JPY",
+}
+
+INTERVALS = {  # TD intervals
+    "30m": "30min",
+    "1H":  "1h",
+    "2H":  "2h",
+    "4H":  "4h",
+    "1D":  "1day",
+}
+OUTPUT_SIZES = [5000, 2000, 1000, 300]  # thử giảm dần để lấy đủ nến
+
+# Ngưỡng lọc / số nến tối thiểu
+ADX_TREND = 20
+MIN_BARS_INTRADAY = 60   # cho 30m/1h/2h/4h
+MIN_BARS_DAILY    = 120  # cho 1d
+
+# ----------- Indicators -----------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rsi(close, n=14):
@@ -79,7 +103,6 @@ def bb_width(close, n=20):
     ma = close.rolling(n).mean()
     sd = close.rolling(n).std(ddof=0)
     return ((ma + 2*sd) - (ma - 2*sd)) / ma
-
 def decorate(df):
     out = df.copy()
     out["EMA20"]  = ema(out["Close"], 20)
@@ -107,110 +130,47 @@ def decide(df):
         return "SHORT"
     return "SIDEWAY"
 
-# ---------- YAHOO (with Session UA) ----------
-_YF_SESSION = requests.Session()
-_YF_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0 Safari/537.36"
-})
-
-def _yahoo_download(symbol, interval, period):
-    logging.debug(f"Yahoo try {symbol} {interval}/{period}")
-    df = yf.download(symbol, interval=interval, period=period,
-                     auto_adjust=False, progress=False, session=_YF_SESSION)
-    if df is None or df.empty or not {"Open","High","Low","Close"}.issubset(df.columns):
-        raise RuntimeError(f"No data for {symbol} @ {interval}/{period}")
-    df = df.dropna().copy()
-    df.index = pd.to_datetime(df.index)
-    logging.info(f"Yahoo OK {symbol} {interval}/{period} -> {len(df)} rows "
-                 f"[{df.index[0]} .. {df.index[-1]}]")
-    return df
-
-def yahoo_intraday(symbol, interval):
-    notes = []
-    if interval not in ("30m", "1h"):
-        raise ValueError("intraday interval must be 30m or 1h")
-    # 30m thử rồi fallback 1h
-    if interval == "30m":
-        for p in INTRADAY_PERIODS:
-            try:
-                return _yahoo_download(symbol, "30m", p), "30m", p, "; ".join(notes)
-            except Exception as e:
-                notes.append(f"30m/{p} fail: {e}")
-        for p in INTRADAY_PERIODS:
-            try:
-                notes.append("fallback 30m→1h")
-                return _yahoo_download(symbol, "1h", p), "1h", p, "; ".join(notes)
-            except Exception as e:
-                notes.append(f"1h/{p} fail: {e}")
-        raise RuntimeError("; ".join(notes))
-    else:
-        last_err = None
-        for p in INTRADAY_PERIODS:
-            try:
-                return _yahoo_download(symbol, "1h", p), "1h", p, "; ".join(notes)
-            except Exception as e:
-                last_err = e; notes.append(f"1h/{p} fail: {e}")
-        raise RuntimeError("; ".join(notes))
-
-def yahoo_daily(symbol):
-    for p in DAILY_PERIODS:
+# ----------- Twelve Data fetch -----------
+def td_download(symbol: str, interval_label: str) -> pd.DataFrame:
+    iv = INTERVALS[interval_label]
+    last_err = None
+    for size in OUTPUT_SIZES:
         try:
-            return _yahoo_download(symbol, "1d", p), "1d", p, ""
+            logging.info(f"TD fetch {symbol} {iv} size={size}")
+            r = requests.get(
+                "https://api.twelvedata.com/time_series",
+                params={
+                    "symbol": symbol,
+                    "interval": iv,
+                    "outputsize": size,
+                    "apikey": os.environ["TWELVE_DATA_KEY"],
+                },
+                timeout=25,
+            )
+            r.raise_for_status()
+            js = r.json()
+            if "values" not in js or not js["values"]:
+                raise RuntimeError(js)
+            df = pd.DataFrame(js["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.sort_values("datetime").set_index("datetime")
+            df = df.rename(columns={"open":"Open","high":"High","low":"Low",
+                                    "close":"Close","volume":"Volume"})
+            df[["Open","High","Low","Close"]] = df[["Open","High","Low","Close"]].astype(float)
+            if "Volume" in df.columns:
+                df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+            logging.info(f"TD OK {symbol} {iv} -> {len(df)} rows [{df.index[0]} .. {df.index[-1]}]")
+            return df
         except Exception as e:
-            logging.warning(f"Yahoo 1d {symbol} {p} fail: {e}")
-    raise RuntimeError(f"Yahoo daily fail for {symbol}")
+            last_err = e
+            logging.warning(f"TD fail {symbol} {iv} size={size}: {e}")
+    raise RuntimeError(f"TD final fail {symbol} {iv}: {last_err}")
 
-# ---------- TWELVE DATA (fallback) ----------
-# Map Yahoo ticker -> TwelveData symbol
-TD_MAP = {
-    "GC=F": "XAU/USD",   # vàng spot trên TD
-    "CL=F": "CL",        # WTI continuous
-    "BTC-USD": "BTC/USD",
-    "EURUSD=X": "EUR/USD",
-    "JPY=X": "USD/JPY",  # TD dùng chiều USD/JPY
-}
-
-def _td_series(symbol, interval):
-    # intervals hợp lệ: 30min, 1h, 1day
-    iv = {"30m":"30min", "1h":"1h", "1d":"1day"}[interval]
-    url = "https://api.twelvedata.com/time_series"
-    r = requests.get(url, params={
-        "symbol": symbol,
-        "interval": iv,
-        "outputsize": 5000,
-        "apikey": TD_KEY
-    }, timeout=25)
-    r.raise_for_status()
-    js = r.json()
-    if "values" not in js:
-        raise RuntimeError(f"TD no values: {js}")
-    df = pd.DataFrame(js["values"])
-    # TD trả newest->oldest
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.sort_values("datetime").set_index("datetime")
-    df = df.rename(columns={
-        "open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"
-    })
-    df[["Open","High","Low","Close"]] = df[["Open","High","Low","Close"]].astype(float)
-    if "Volume" in df.columns:
-        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
-    return df
-
-def td_fetch(yahoo_symbol, interval):
-    sym = TD_MAP[yahoo_symbol]
-    logging.info(f"TwelveData fetch {sym} {interval}")
-    df = _td_series(sym, "1d" if interval=="1d" else interval)
-    logging.info(f"TwelveData OK {sym} {interval} -> {len(df)} rows "
-                 f"[{df.index[0]} .. {df.index[-1]}]")
-    return df, interval, "TD", ""
-
-# ---------- TELEGRAM ----------
-def send_tele(text):
-    if not SEND_TELE: return
+# ----------- Telegram ----------
+def send_tele(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        logging.warning("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID"); return
+        logging.warning("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+        return
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
@@ -222,85 +182,56 @@ def send_tele(text):
     except Exception as e:
         logging.exception(f"Telegram error: {e}")
 
-# ---------- ANALYZE ONE ----------
-def analyze_one(name, ticker):
-    logging.info(f"=== Start {name} ({ticker}) ===")
+# ----------- Analyze one ----------
+def analyze_one(name: str, td_symbol: str) -> str:
+    logging.info(f"=== Start {name} ({td_symbol}) ===")
     notes = []
 
-    # 30m
-    try:
-        d30, i30, p30, n30 = yahoo_intraday(ticker, "30m")
-        if n30: notes.append(f"YF 30m: {n30}")
-    except Exception as e:
-        notes.append(f"YF 30m ERR: {e}")
-        if TD_KEY and ticker in TD_MAP:
-            try:
-                d30, i30, p30, n30 = td_fetch(ticker, "30m")
-                notes.append("TD 30m OK")
-            except Exception as ee:
-                notes.append(f"TD 30m ERR: {ee}")
-                d30 = None
-        else:
-            d30 = None
-    s30 = "N/A"
-    if isinstance(d30, pd.DataFrame) and len(d30) >= 100:
-        s30 = decide(decorate(d30))
+    frames = {}
+    for lbl in ["30m", "1H", "2H", "4H", "1D"]:
+        try:
+            frames[lbl] = td_download(td_symbol, lbl)
+        except Exception as e:
+            frames[lbl] = None
+            notes.append(f"{lbl} ERR: {e}")
 
-    # 1H
-    try:
-        d1h, i1h, p1h, n1h = yahoo_intraday(ticker, "1h")
-        if n1h: notes.append(f"YF 1h: {n1h}")
-    except Exception as e:
-        notes.append(f"YF 1h ERR: {e}")
-        if TD_KEY and ticker in TD_MAP:
-            try:
-                d1h, i1h, p1h, n1h = td_fetch(ticker, "1h")
-                notes.append("TD 1h OK")
-            except Exception as ee:
-                notes.append(f"TD 1h ERR: {ee}")
-                d1h = None
-        else:
-            d1h = None
-    s1h = "N/A"
-    if isinstance(d1h, pd.DataFrame) and len(d1h) >= 100:
-        s1h = decide(decorate(d1h))
+    def sig_for(df, is_daily=False):
+        if isinstance(df, pd.DataFrame):
+            n = len(df)
+            need = MIN_BARS_DAILY if is_daily else MIN_BARS_INTRADAY
+            logging.info(f"bars {name} -> {'daily' if is_daily else 'intra'} {n}")
+            if n >= need:
+                return decide(decorate(df))
+        return "N/A"
 
-    # 1D
-    try:
-        d1d, i1d, p1d, _ = yahoo_daily(ticker)
-    except Exception as e:
-        notes.append(f"YF 1d ERR: {e}")
-        if TD_KEY and ticker in TD_MAP:
-            try:
-                d1d, _, _, _ = td_fetch(ticker, "1d")
-                notes.append("TD 1d OK")
-            except Exception as ee:
-                notes.append(f"TD 1d ERR: {ee}")
-                d1d = None
-    s1d = "N/A"
-    if isinstance(d1d, pd.DataFrame) and len(d1d) >= 200:
-        s1d = decide(decorate(d1d))
+    s30 = sig_for(frames["30m"])
+    s1h = sig_for(frames["1H"])
+    s2h = sig_for(frames["2H"])
+    s4h = sig_for(frames["4H"])
+    s1d = sig_for(frames["1D"], is_daily=True)
 
-    # Compose
-    short_line = s30 if (s30 == s1h and s30 != "N/A") else f"Mixed (30m:{s30}, 1H:{s1h})"
-    msg = f"==={name}===\n30m-1H: {short_line}\n1H: {s1h}\n1D: {s1d}"
+    line_short = s30 if (s30 == s1h and s30 != "N/A") else f"Mixed (30m:{s30}, 1H:{s1h})"
+    line_mid   = s2h if (s2h == s4h and s2h != "N/A") else f"Mixed (2H:{s2h}, 4H:{s4h})"
+
+    msg = f"==={name}===\n30m-1H: {line_short}\n2H-4H: {line_mid}\n1D: {s1d}"
     if notes and INC_ERR_TG:
         compact = "; ".join(notes)
         if len(compact) > 700: compact = compact[:700] + "..."
         msg += f"\n⚠ {compact}"
-    logging.info(msg.replace("\n"," | "))
+
+    logging.info(msg.replace("\n", " | "))
     return msg
 
-# ---------- MAIN ----------
+# ----------- Main ----------
 def main():
-    parts = []
-    for name, ticker in ASSETS.items():
+    reports = []
+    for name, sym in ASSETS.items():
         try:
-            parts.append(analyze_one(name, ticker))
+            reports.append(analyze_one(name, sym))
         except Exception as e:
             logging.exception(f"{name} fatal")
-            parts.append(f"==={name}===\nLỗi nghiêm trọng: {e}")
-    send_tele("\n\n".join(parts))
+            reports.append(f"==={name}===\nLỗi nghiêm trọng: {e}")
+    send_tele("\n\n".join(reports))
 
 if __name__ == "__main__":
     main()
