@@ -56,6 +56,40 @@ MIN_BARS_DAILY = 120
 ADX_TREND = 20
 
 # ----------- Indicators -----------
+TD_SLEEP_BETWEEN_CALL = float(os.getenv("TD_SLEEP_BETWEEN_CALL", "8"))  # giây
+
+def td_single_time_series(symbol: str, interval: str, outputsize=2000, retries=2):
+    """interval: '30min','1h','2h','4h','1day'"""
+    url = "https://api.twelvedata.com/time_series"
+    params = {"symbol": symbol, "interval": interval, "outputsize": outputsize, "apikey": TD_KEY}
+    last_err = None
+    for attempt in range(retries + 1):
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code == 429:
+            wait = 65 if attempt < retries else 0
+            logging.warning(f"TD 429 for {symbol} {interval}, backoff {wait}s (attempt {attempt+1}/{retries+1})")
+            if wait: time.sleep(wait); continue
+        try:
+            r.raise_for_status()
+            js = r.json()
+            if "values" not in js or not js["values"]:
+                raise RuntimeError(f"empty payload: {js}")
+            df = pd.DataFrame(js["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.sort_values("datetime").set_index("datetime")
+            df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+            df[["Open","High","Low","Close"]] = df[["Open","High","Low","Close"]].astype(float)
+            if "Volume" in df.columns:
+                df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+            logging.info(f"TD OK {symbol} {interval}: {len(df)} rows [{df.index[0]}..{df.index[-1]}]")
+            # throttle mỗi call để không vượt credit/min
+            time.sleep(TD_SLEEP_BETWEEN_CALL)
+            return df
+        except Exception as e:
+            last_err = e
+            logging.warning(f"TD fail {symbol} {interval}: {e}")
+            time.sleep(TD_SLEEP_BETWEEN_CALL)
+    raise RuntimeError(f"TD final fail {symbol} {interval}: {last_err}")
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def rsi(close, n=14):
     d = close.diff()
@@ -106,55 +140,46 @@ def decide(df):
         and last["RSI14"] < 45 and last["MACD"] < last["MACD_SIG"] and trending):
         return "SHORT"
     return "SIDEWAY"
+def fetch_all_frames(td_symbol: str):
+    IV = {"30m":"30min", "1H":"1h", "2H":"2h", "4H":"4h", "1D":"1day"}
+    out = {}
+    targets = ["30m","1H","2H","4H","1D"]
 
-# ----------- TD batch fetch -----------
-def td_batch_time_series(symbols, interval):
-    """
-    symbols: list[str] -> joined by comma
-    interval: '30min','1h','2h','4h','1day'
-    Trả về dict[symbol] = DataFrame
-    Retry 429: sleep 65s và thử tối đa 2 lần
-    """
-    joined = ",".join(symbols)
-    params = {
-        "symbol": joined,
-        "interval": interval,
-        "outputsize": OUTPUTSIZE,
-        "apikey": TD_KEY,
-    }
-    url = "https://api.twelvedata.com/time_series"
+    # fallback riêng cho dầu
+    candidates = [td_symbol] if td_symbol != "CL" else ["CL", "WTI/USD"]
 
-    for attempt in range(3):
-        logging.info(f"TD batch fetch {interval} | symbols={joined}")
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code == 429:
-            logging.warning(f"TD 429 rate limit on {interval}. Backoff 65s (attempt {attempt+1}/3)")
-            time.sleep(65)
-            continue
-        r.raise_for_status()
-        js = r.json()
-        out = {}
-        # Khi batch, TD trả dict theo symbol
-        for sym in symbols:
-            payload = js.get(sym)
-            if not payload or "values" not in payload or not payload["values"]:
-                logging.warning(f"TD {sym} {interval} empty")
-                out[sym] = None
-                continue
-            df = pd.DataFrame(payload["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.sort_values("datetime").set_index("datetime")
-            df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
-            df[["Open","High","Low","Close"]] = df[["Open","High","Low","Close"]].astype(float)
-            if "Volume" in df.columns:
-                df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
-            logging.info(f"TD OK {sym} {interval}: {len(df)} rows [{df.index[0]} .. {df.index[-1]}]")
-            out[sym] = df
-        return out
+    for lbl in targets:
+        got = None
+        for sym in candidates:
+            try:
+                got = td_single_time_series(sym, IV[lbl])
+                break
+            except Exception as e:
+                logging.warning(f"Try {sym} {IV[lbl]} fail: {e}")
+        out[lbl] = got
+    return out
 
-    # nếu qua 3 lần vẫn 429 hoặc lỗi khác
-    raise RuntimeError(f"TD batch {interval} failed after retries")
+def analyze_one(name: str, td_symbol: str) -> str:
+    logging.info(f"=== Start {name} ({td_symbol}) ===")
+    frames = fetch_all_frames(td_symbol)
 
+    def sig(df, is_daily=False):
+        need = MIN_BARS_DAILY if is_daily else MIN_BARS_INTRADAY
+        if isinstance(df, pd.DataFrame) and len(df) >= need:
+            return decide(decorate(df))
+        return "N/A"
+
+    s30 = sig(frames["30m"])
+    s1h = sig(frames["1H"])
+    s2h = sig(frames["2H"])
+    s4h = sig(frames["4H"])
+    s1d = sig(frames["1D"], is_daily=True)
+
+    short = s30 if (s30 == s1h and s30 != "N/A") else f"Mixed (30m:{s30}, 1H:{s1h})"
+    mid   = s2h if (s2h == s4h and s2h != "N/A") else f"Mixed (2H:{s2h}, 4H:{s4h})"
+    msg = f"==={name}===\n30m-1H: {short}\n2H-4H: {mid}\n1D: {s1d}"
+    logging.info(msg.replace("\n", " | "))
+    return msg
 # ----------- Telegram ----------
 def send_tele(text):
     if not BOT_TOKEN or not CHAT_ID:
@@ -178,7 +203,7 @@ def main():
     frames_by_iv = {}
     for lbl, iv in INTERVALS.items():
         try:
-            frames_by_iv[lbl] = td_batch_time_series(symbols, iv)
+            frames_by_iv[lbl] = fetch_all_frames(symbols, iv)
         except Exception as e:
             logging.exception(f"Batch {iv} failed")
             frames_by_iv[lbl] = {s: None for s in symbols}
