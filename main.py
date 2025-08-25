@@ -125,33 +125,25 @@ def decide(df):
     return label
   
 def pct_slope(series, lookback=SLOPE_LOOKBACK):
-    """độ dốc tương đối: (EMA_t - EMA_{t-LB}) / EMA_{t-LB}"""
-    if len(series) < lookback + 1:
-        return 0.0
-    a = series.iloc[-1]
-    b = series.iloc[-1 - lookback]
-    return float((a - b) / b) if b else 0.0
+    if len(series) < lookback + 1: return 0.0
+    a, b = series.iloc[-1], series.iloc[-1-lookback]
+    return float((a-b)/b) if b else 0.0
 
 def atr(df, n=14):
     return true_range(df).rolling(n).mean()
 
 def rising(series, n=3):
-    """serie tăng liên tiếp N bar?"""
-    if len(series) < n+1: 
-        return False
-    last = series.tail(n+1)
-    return all(last.diff().iloc[1:] > 0)
+    if len(series) < n+1: return False
+    x = series.tail(n+1)
+    return bool((x.diff().iloc[1:] > 0).all())
 
 def persist(cond_series, n=PERSIST_BARS):
-    """điều kiện True liên tiếp N bar?"""
-    if len(cond_series) < n:
-        return False
+    if len(cond_series) < n: return False
     return bool(cond_series.tail(n).all())
 
 def build_indicators(df):
-    d = decorate(df)
+    d = decorate(df).copy()
     d["ATR14"] = atr(d, 14)
-    # các điều kiện “thô”
     d["ema_align_long"]  = (d["EMA20"] > d["EMA50"]) & (d["EMA50"] > d["EMA200"])
     d["ema_align_short"] = (d["EMA20"] < d["EMA50"]) & (d["EMA50"] < d["EMA200"])
     d["macd_bull"] = d["MACD"] > d["MACD_SIG"]
@@ -159,44 +151,36 @@ def build_indicators(df):
     d["rsi_bull"]  = d["RSI14"] > RSI_LONG
     d["rsi_bear"]  = d["RSI14"] < RSI_SHORT
     d["adx_ok"]    = d["ADX14"] > ADX_MIN
-    # độ dốc EMA (tăng/giảm)
-    d["slope50"]   = d["EMA50"].pct_change(SLOPE_LOOKBACK)
-    d["slope200"]  = d["EMA200"].pct_change(SLOPE_LOOKBACK)
     return d
 
 def score_signal(d):
-    """Trả về (label, score) với bộ tiêu chí chặt hơn"""
     last = d.iloc[-1]
-    # volatility tối thiểu
     vol_ok = (last["ATR14"] / last["Close"]) > ATR_MIN_MULT
     adx_up = rising(d["ADX14"], ADX_RISING_BARS)
 
-    # persistence
-    ema_long_persist  = persist(d["ema_align_long"])
-    ema_short_persist = persist(d["ema_align_short"])
-    macd_bull_persist = persist(d["macd_bull"])
-    macd_bear_persist = persist(d["macd_bear"])
+    ema_long_p = persist(d["ema_align_long"])
+    ema_short_p= persist(d["ema_align_short"])
+    macd_bull_p= persist(d["macd_bull"])
+    macd_bear_p= persist(d["macd_bear"])
 
     slope50_pos = pct_slope(d["EMA50"])  > 0
     slope200_pos= pct_slope(d["EMA200"]) > 0
     slope50_neg = pct_slope(d["EMA50"])  < 0
     slope200_neg= pct_slope(d["EMA200"]) < 0
 
-    # --- chấm điểm LONG ---
     long_score = 0
-    if ema_long_persist: long_score += 1
+    if ema_long_p: long_score += 1
     if last["rsi_bull"]: long_score += 1
-    if macd_bull_persist: long_score += 1
+    if macd_bull_p: long_score += 1
     if last["adx_ok"] and adx_up: long_score += 1
     if slope50_pos and slope200_pos: long_score += 1
     if vol_ok: long_score += 1
 
-    # --- chấm điểm SHORT ---
     short_score = 0
-    if ema_short_persist: short_score += 1
+    if ema_short_p: short_score += 1
     if last["rsi_bear"]: short_score += 1
-    if macd_bear_persist: short_score += 1
-    if last["adx_ok"] and adx_up: short_score += 1   # xu hướng mạnh, chiều xét ở EMA/RSI/MACD
+    if macd_bear_p: short_score += 1
+    if last["adx_ok"] and adx_up: short_score += 1
     if slope50_neg and slope200_neg: short_score += 1
     if vol_ok: short_score += 1
 
@@ -256,17 +240,6 @@ def send_tele(text: str):
         )
     except Exception as e:
         logging.exception(f"Telegram error: {e}")
-# Ưu tiên 1H làm chính; yêu cầu đồng thuận tối thiểu:
-# - Nếu 1H LONG thì 2H hoặc 4H không được SHORT; 1D không SHORT
-# - Nếu 1H SHORT thì 2H hoặc 4H không được LONG; 1D không LONG
-def filter_by_htf(s30, s1h, s2h, s4h, s1d):
-    if s1h == "LONG":
-        if s2h == "SHORT" or s4h == "SHORT" or s1d == "SHORT":
-            s1h = "SIDEWAY"
-    elif s1h == "SHORT":
-        if s2h == "LONG" or s4h == "LONG" or s1d == "LONG":
-            s1h = "SIDEWAY"
-    return s30, s1h, s2h, s4h, s1d
 
 # ---------- Main ----------
 def main():
@@ -306,9 +279,6 @@ def main():
         s2h = sig(frames.get("2H"))
         s4h = sig(frames.get("4H"))
         s1d = sig(frames.get("1D"), is_daily=True)
-
-        # 4) Lọc theo khung cao hơn (ưu tiên 1H)
-        s30, s1h, s2h, s4h, s1d = filter_by_htf(s30, s1h, s2h, s4h, s1d)
 
         # 5) Ghép message theo format yêu cầu
         line_short = s30 if (s30 == s1h and s30 != "N/A") else f"Mixed (30m:{s30}, 1H:{s1h})"
