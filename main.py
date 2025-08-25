@@ -268,7 +268,6 @@ def filter_by_htf(s30, s1h, s2h, s4h, s1d):
             s1h = "SIDEWAY"
     return s30, s1h, s2h, s4h, s1d
 
-s30, s1h, s2h, s4h, s1d = filter_by_htf(s30, s1h, s2h, s4h, s1d)
 # ---------- Main ----------
 def main():
     reports = []
