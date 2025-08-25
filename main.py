@@ -58,7 +58,15 @@ ASSETS = {
 }
 TD_INTERVAL = {"30m": "30min", "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1day"}
 OUTPUTSIZE = 2000
-
+# ---- Stronger filters / thresholds ----
+ADX_MIN = 22            # >20 trước đây
+ADX_RISING_BARS = 3     # ADX tăng liên tiếp N bar
+RSI_LONG = 55           # RSI ngưỡng LONG
+RSI_SHORT = 45          # RSI ngưỡng SHORT
+SLOPE_LOOKBACK = 5      # số bar để kiểm tra độ dốc EMA
+ATR_MIN_MULT = 0.002    # tối thiểu biến động: ATR / Close > 0.2% (lọc thị trường “đứng hình”)
+PERSIST_BARS = 2        # yêu cầu các điều kiện giữ ít nhất N bar (MACD hist, EMA alignment)
+CONF_THRESHOLD = 3      # điểm tối thiểu để coi là LONG/SHORT (xem scorer bên dưới)
 # Ngưỡng lọc / số nến tối thiểu
 MIN_BARS_INTRADAY = 60    # 30m/1H/2H/4H
 MIN_BARS_DAILY    = 120   # 1D
@@ -112,17 +120,91 @@ def decorate(df):
     return out
 
 def decide(df):
-    last = df.iloc[-1]
-    trending = (last["ADX14"] > ADX_TREND) and \
-               (last["BBWIDTH"] > df["BBWIDTH"].rolling(50).mean().iloc[-1])
-    if (last["Close"] > last["EMA20"] > last["EMA50"] > last["EMA200"]
-        and last["RSI14"] > 55 and last["MACD"] > last["MACD_SIG"] and trending):
-        return "LONG"
-    if (last["Close"] < last["EMA20"] < last["EMA50"] < last["EMA200"]
-        and last["RSI14"] < 45 and last["MACD"] < last["MACD_SIG"] and trending):
-        return "SHORT"
-    return "SIDEWAY"
+    d = build_indicators(df)
+    label, _ = score_signal(d)
+    return label
+  
+def pct_slope(series, lookback=SLOPE_LOOKBACK):
+    """độ dốc tương đối: (EMA_t - EMA_{t-LB}) / EMA_{t-LB}"""
+    if len(series) < lookback + 1:
+        return 0.0
+    a = series.iloc[-1]
+    b = series.iloc[-1 - lookback]
+    return float((a - b) / b) if b else 0.0
 
+def atr(df, n=14):
+    return true_range(df).rolling(n).mean()
+
+def rising(series, n=3):
+    """serie tăng liên tiếp N bar?"""
+    if len(series) < n+1: 
+        return False
+    last = series.tail(n+1)
+    return all(last.diff().iloc[1:] > 0)
+
+def persist(cond_series, n=PERSIST_BARS):
+    """điều kiện True liên tiếp N bar?"""
+    if len(cond_series) < n:
+        return False
+    return bool(cond_series.tail(n).all())
+
+def build_indicators(df):
+    d = decorate(df)
+    d["ATR14"] = atr(d, 14)
+    # các điều kiện “thô”
+    d["ema_align_long"]  = (d["EMA20"] > d["EMA50"]) & (d["EMA50"] > d["EMA200"])
+    d["ema_align_short"] = (d["EMA20"] < d["EMA50"]) & (d["EMA50"] < d["EMA200"])
+    d["macd_bull"] = d["MACD"] > d["MACD_SIG"]
+    d["macd_bear"] = d["MACD"] < d["MACD_SIG"]
+    d["rsi_bull"]  = d["RSI14"] > RSI_LONG
+    d["rsi_bear"]  = d["RSI14"] < RSI_SHORT
+    d["adx_ok"]    = d["ADX14"] > ADX_MIN
+    # độ dốc EMA (tăng/giảm)
+    d["slope50"]   = d["EMA50"].pct_change(SLOPE_LOOKBACK)
+    d["slope200"]  = d["EMA200"].pct_change(SLOPE_LOOKBACK)
+    return d
+
+def score_signal(d):
+    """Trả về (label, score) với bộ tiêu chí chặt hơn"""
+    last = d.iloc[-1]
+    # volatility tối thiểu
+    vol_ok = (last["ATR14"] / last["Close"]) > ATR_MIN_MULT
+    adx_up = rising(d["ADX14"], ADX_RISING_BARS)
+
+    # persistence
+    ema_long_persist  = persist(d["ema_align_long"])
+    ema_short_persist = persist(d["ema_align_short"])
+    macd_bull_persist = persist(d["macd_bull"])
+    macd_bear_persist = persist(d["macd_bear"])
+
+    slope50_pos = pct_slope(d["EMA50"])  > 0
+    slope200_pos= pct_slope(d["EMA200"]) > 0
+    slope50_neg = pct_slope(d["EMA50"])  < 0
+    slope200_neg= pct_slope(d["EMA200"]) < 0
+
+    # --- chấm điểm LONG ---
+    long_score = 0
+    if ema_long_persist: long_score += 1
+    if last["rsi_bull"]: long_score += 1
+    if macd_bull_persist: long_score += 1
+    if last["adx_ok"] and adx_up: long_score += 1
+    if slope50_pos and slope200_pos: long_score += 1
+    if vol_ok: long_score += 1
+
+    # --- chấm điểm SHORT ---
+    short_score = 0
+    if ema_short_persist: short_score += 1
+    if last["rsi_bear"]: short_score += 1
+    if macd_bear_persist: short_score += 1
+    if last["adx_ok"] and adx_up: short_score += 1   # xu hướng mạnh, chiều xét ở EMA/RSI/MACD
+    if slope50_neg and slope200_neg: short_score += 1
+    if vol_ok: short_score += 1
+
+    if long_score >= CONF_THRESHOLD and long_score > short_score:
+        return "LONG", long_score
+    if short_score >= CONF_THRESHOLD and short_score > long_score:
+        return "SHORT", short_score
+    return "SIDEWAY", max(long_score, short_score)
 # ---------- TwelveData: single call (retry + throttle) ----------
 def td_single_time_series(symbol: str, interval: str, outputsize=OUTPUTSIZE, retries=2):
     """
@@ -174,19 +256,33 @@ def send_tele(text: str):
         )
     except Exception as e:
         logging.exception(f"Telegram error: {e}")
+# Ưu tiên 1H làm chính; yêu cầu đồng thuận tối thiểu:
+# - Nếu 1H LONG thì 2H hoặc 4H không được SHORT; 1D không SHORT
+# - Nếu 1H SHORT thì 2H hoặc 4H không được LONG; 1D không LONG
+def filter_by_htf(s30, s1h, s2h, s4h, s1d):
+    if s1h == "LONG":
+        if s2h == "SHORT" or s4h == "SHORT" or s1d == "SHORT":
+            s1h = "SIDEWAY"
+    elif s1h == "SHORT":
+        if s2h == "LONG" or s4h == "LONG" or s1d == "LONG":
+            s1h = "SIDEWAY"
+    return s30, s1h, s2h, s4h, s1d
 
+s30, s1h, s2h, s4h, s1d = filter_by_htf(s30, s1h, s2h, s4h, s1d)
 # ---------- Main ----------
 def main():
     reports = []
-    any_signal = False  # có ít nhất 1 LONG/SHORT?
+    any_signal = False  # chỉ gửi khi có ít nhất 1 LONG/SHORT
 
     for display, base_symbol in ASSETS.items():
         logging.info(f"=== Start {display} ({base_symbol}) ===")
         notes = []
+        # fallback riêng cho dầu
         sym_candidates = [base_symbol] if base_symbol != "CL" else ["CL", "WTI/USD"]
 
+        # 1) Lấy dữ liệu từng khung
         frames = {}
-        for lbl, iv in TD_INTERVAL.items():
+        for lbl, iv in TD_INTERVAL.items():   # TD_INTERVAL: {"30m":"30min", "1H":"1h", "2H":"2h", "4H":"4h", "1D":"1day"}
             df = None
             for sym in sym_candidates:
                 try:
@@ -198,29 +294,41 @@ def main():
             if df is None:
                 notes.append(f"{lbl} ERR")
 
+        # 2) Hàm tính tín hiệu cho từng khung
         def sig(df, is_daily=False):
             need = MIN_BARS_DAILY if is_daily else MIN_BARS_INTRADAY
             if isinstance(df, pd.DataFrame) and len(df) >= need:
                 return decide(decorate(df))
             return "N/A"
 
-        s30 = sig(frames["30m"])
-        s1h = sig(frames["1H"])
-        s2h = sig(frames["2H"])
-        s4h = sig(frames["4H"])
-        s1d = sig(frames["1D"], is_daily=True)
+        # 3) Tín hiệu từng khung
+        s30 = sig(frames.get("30m"))
+        s1h = sig(frames.get("1H"))
+        s2h = sig(frames.get("2H"))
+        s4h = sig(frames.get("4H"))
+        s1d = sig(frames.get("1D"), is_daily=True)
 
+        # 4) Lọc theo khung cao hơn (ưu tiên 1H)
+        s30, s1h, s2h, s4h, s1d = filter_by_htf(s30, s1h, s2h, s4h, s1d)
+
+        # 5) Ghép message theo format yêu cầu
         line_short = s30 if (s30 == s1h and s30 != "N/A") else f"Mixed (30m:{s30}, 1H:{s1h})"
         line_mid   = s2h if (s2h == s4h and s2h != "N/A") else f"Mixed (2H:{s2h}, 4H:{s4h})"
         msg = f"==={display}===\n30m-1H: {line_short}\n2H-4H: {line_mid}\n1D: {s1d}"
 
-        # chỉ add nếu có LONG/SHORT ở bất kỳ khung nào
+        if INC_ERR_TG and notes:
+            msg += f"\n⚠ thiếu dữ liệu: {', '.join(notes)}"
+
+        logging.info(msg.replace("\n", " | "))
+
+        # 6) Chỉ add khi có LONG/SHORT ở bất kỳ khung nào
         if any(x in ("LONG", "SHORT") for x in [s30, s1h, s2h, s4h, s1d]):
             reports.append(msg)
             any_signal = True
         else:
-            logging.info(f"{display}: all SIDEWAY/N/A -> skip Telegram")
+            logging.info(f"{display}: all SIDEWAY/N/A -> skip")
 
+    # 7) Gửi Telegram nếu có tín hiệu
     if any_signal:
         send_tele("\n\n".join(reports))
     else:
