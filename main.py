@@ -172,7 +172,7 @@ def combine_label(a: str, b: str, la: str, lb: str) -> str:
         return a
     if a == "N/A" and b == "N/A":
         return "N/A"
-    return f"Mixed ({la}:{a}, {lb}:{b})"
+    return f"({la}:{a}, {lb}:{b})"
 
 def send_telegram(text: str) -> None:
     if not BOT_TOKEN or not CHAT_ID:
