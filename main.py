@@ -2,287 +2,241 @@
 # -*- coding: utf-8 -*-
 
 """
-Main bot: fetch OHLC from TwelveData in batch, analyze trend per timeframe,
-and send compact summary to Telegram.
-
-ENV required:
-- TWELVEDATA_API_KEY
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_CHAT_ID
-Optional:
-- LOG_LEVEL (default INFO)
-- TZ (default Asia/Ho_Chi_Minh)
+TRADE GOODS bot — batched TwelveData fetch + compact signal + Telegram
+- Intervals: 15m, 30m, 1h, 2h, 4h, 1day
+- Symbols: BTC/USD, ETH/USD, XAU/USD (Gold), WTI/USD (Oil), EUR/USD, USD/JPY
+- Groups in message: 15m-30m, 1h-2h, 4h-1D
+- Only send when there is at least one LONG/SHORT. If all are SIDEWAY → skip Telegram.
+Environment variables:
+  TD_KEY                TwelveData API key
+  TELEGRAM_BOT_TOKEN    Telegram bot token
+  TELEGRAM_CHAT_ID      Telegram chat id
+  LOG_LEVEL             INFO (default) / DEBUG
 """
 
 import os
-import sys
 import time
 import math
 import json
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple
+from datetime import datetime, timezone, timedelta
 
 import requests
 
-# ---------------- Logging ----------------
+# ------------ Logging ------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
+logger = logging.getLogger(__name__)
 
-# ---------------- ENV ----------------
-TD_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+# ------------ ENV ------------
+TD_KEY = os.getenv("TD_KEY", "").strip()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TITLE_PREFIX = "💵 TRADE GOODS"
 
-if not TD_KEY:
-    logging.warning("Missing TWELVEDATA_API_KEY")
-if not BOT_TOKEN or not CHAT_ID:
-    logging.warning("Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID")
+TITLE = "💵 TRADE GOODS"
 
-# ---------------- Const ----------------
-TD_BASE = "https://api.twelvedata.com"
+API_TS = "https://api.twelvedata.com/time_series"
 HTTP_TIMEOUT = 30
 
-# Telegram formatting switch
-USE_MD = False
-
-# Standardized symbol map for TwelveData
-SYMBOL_MAP: Dict[str, str] = {
-    "XAUUSD": "XAU/USD",
-    "WTI": "WTI/USD",        # Spot WTI index at TwelveData
-    "CL": "CL",              # Alternative: futures continuous (may require paid)
-    "BTCUSD": "BTC/USD",
-    "ETHUSD": "ETH/USD",
-    "EURUSD": "EUR/USD",
-    "USDJPY": "USD/JPY",
+# Symbols mapping: {display: twelvedata_symbol}
+SYMBOLS: Dict[str, str] = {
+    "Bitcoin": "BTC/USD",
+    "Ethereum": "ETH/USD",
+    "XAU/USD (Gold)": "XAU/USD",
+    "WTI Oil": "WTI/USD",
+    "EUR/USD": "EUR/USD",
+    "USD/JPY": "USD/JPY",
 }
 
-# Default watchlist
-WATCH_SYMBOLS = ["XAUUSD", "WTI", "BTCUSD", "ETHUSD", "EURUSD", "USDJPY"]
-
-# Intervals (pair formatting in output)
 INTERVALS = ["15min", "30min", "1h", "2h", "4h", "1day"]
 
-# ---------------- Time helpers ----------------
+# ------------ Helpers ------------
 def now_vn() -> datetime:
-    """Return now in VN timezone if TZ=Asia/Ho_Chi_Minh else local."""
-    tzname = os.getenv("TZ", "Asia/Ho_Chi_Minh")
     try:
-        if tzname == "Asia/Ho_Chi_Minh":
-            return datetime.now(timezone(timedelta(hours=7)))
-        return datetime.now()
+        return datetime.now(timezone(timedelta(hours=7)))
     except Exception:
         return datetime.utcnow()
 
-# ---------------- HTTP helpers ----------------
-def http_get(url: str, params: dict) -> dict:
-    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    try:
-        return r.json()
-    except Exception:
-        logging.debug("Raw response not JSON: %s", r.text[:500])
-        raise
-
-def td_batch_time_series(symbols: List[str], interval: str, outputsize: int = 120, retries: int = 2) -> dict:
-    """
-    Call TwelveData time_series with comma-joined symbols to minimize API calls.
-    Handles 429 by brief sleep & retry.
-    Returns raw JSON.
-    """
-    if not symbols:
-        return {}
-
-    url = f"{TD_BASE}/time_series"
-    params = {
-        "symbol": ",".join(symbols),
-        "interval": interval,
-        "outputsize": outputsize,
-        "format": "JSON",
-        "apikey": TD_KEY,
-    }
-
-    last_err: Exception | None = None
-    for attempt in range(retries + 1):
-        try:
-            j = http_get(url, params)
-            # If response is a single timeseries (dict with "values"), normalize into dict
-            if "values" in j and "meta" in j:
-                sym = j.get("meta", {}).get("symbol")
-                return {sym: j}
-            return j
-        except requests.HTTPError as e:
-            last_err = e
-            code = e.response.status_code if e.response is not None else None
-            if code == 429:
-                wait = 3 + attempt * 2
-                logging.warning("429 rate limited at interval=%s, sleeping %ss...", interval, wait)
-                time.sleep(wait)
-                continue
-            raise
-        except Exception as e:
-            last_err = e
-            logging.warning("Fetch error interval=%s symbols=%s: %s", interval, symbols, e)
-            time.sleep(1.0 + attempt * 0.5)
-    if last_err:
-        raise last_err
-    return {}
-
-def normalize_symbol(sym: str) -> str:
-    return SYMBOL_MAP.get(sym.upper(), sym)
-
-# ---------------- TA helpers ----------------
-def ema(values: List[float], period: int) -> List[float]:
-    """Simple EMA implementation. Returns list of same length, with Nones for warmup replaced by SMA for first seed."""
-    if not values or period <= 1:
-        return values[:]
-    k = 2.0 / (period + 1.0)
-    out: List[float] = []
-    ema_prev = None
-    for i, v in enumerate(values):
-        if v is None:
-            out.append(ema_prev if ema_prev is not None else None)
-            continue
-        if ema_prev is None:
-            # seed by SMA of first P points (or first value if not enough)
-            start = max(0, i - period + 1)
-            window = [x for x in values[start:i+1] if x is not None]
-            ema_prev = sum(window) / len(window) if window else v
-        else:
-            ema_prev = (v - ema_prev) * k + ema_prev
-        out.append(ema_prev)
+def ema(series: List[float], span: int) -> List[float]:
+    """Simple EMA without pandas."""
+    if not series:
+        return []
+    alpha = 2 / (span + 1.0)
+    out = []
+    e = series[0]
+    out.append(e)
+    for x in series[1:]:
+        e = alpha * x + (1 - alpha) * e
+        out.append(e)
     return out
 
-def decide_signal_from_candles(values: List[dict]) -> str:
+def classify(prices: List[float]) -> str:
     """
-    Decide LONG/SHORT/SIDEWAY from last 40 candles using EMA20 & its slope.
-    TwelveData values are newest-first; we reverse to oldest-first.
+    Classify trend using EMA20/EMA50 and slope.
+    LONG  if EMA20>EMA50 and slope_up
+    SHORT if EMA20<EMA50 and slope_down
+    else SIDEWAY
     """
-    if not values or len(values) < 25:
+    if not prices or len(prices) < 60:
         return "N/A"
-    # Reverse to chronological
-    closes = [float(x.get("close")) for x in reversed(values)]
-    # Compute EMA20
-    e20 = ema(closes, 20)
-    c_last = closes[-1]
-    e_last = e20[-1]
-    # slope from last 5 bars
-    e_prev = e20[-6]
-    slope = e_last - e_prev
-
-    # thresholds
-    band = max(0.0001, 0.003 * abs(e_last))  # ~0.3% band
-    if c_last > e_last + band and slope > 0:
+    fast = ema(prices, 20)
+    slow = ema(prices, 50)
+    f1, s1 = fast[-1], slow[-1]
+    # slope via last 5 bars
+    tail = prices[-5:]
+    slope = tail[-1] - tail[0]
+    if f1 > s1 and slope > 0:
         return "LONG"
-    if c_last < e_last - band and slope < 0:
+    if f1 < s1 and slope < 0:
         return "SHORT"
     return "SIDEWAY"
 
-# ---------------- Fetch & analyze ----------------
-def fetch_all(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Return dict {interval: {symbol: series_json}}"""
-    norm = [normalize_symbol(s) for s in symbols]
-    out: Dict[str, Dict[str, Any]] = {}
-    for iv in INTERVALS:
+def fetch_timeframe(interval: str, td_symbols: List[str], retries: int = 2, sleep_on_429: int = 65) -> Dict[str, List[float]]:
+    """
+    Fetch close prices for many symbols in one request for a single interval.
+    Returns dict: {td_symbol: [closes newest_last]}
+    """
+    params = {
+        "symbol": ",".join(td_symbols),
+        "interval": interval,
+        "outputsize": 120,  # enough for EMA50
+        "apikey": TD_KEY,
+        "format": "JSON",
+    }
+    for attempt in range(retries + 1):
         try:
-            data = td_batch_time_series(norm, iv, outputsize=120)
-            out[iv] = data
-            time.sleep(0.7)  # stay under free limit
+            r = requests.get(API_TS, params=params, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            j = r.json()
+            # Handle error shape (when querying multiple, errors may be per key or global)
+            if isinstance(j, dict) and j.get("status") == "error":
+                msg = str(j)
+                if "429" in msg or "credits" in msg.lower():
+                    if attempt < retries:
+                        logger.warning("Rate limited (global). Sleeping %ss then retry...", sleep_on_429)
+                        time.sleep(sleep_on_429)
+                        continue
+                logger.warning("No data for %s: %s", interval, msg)
+                return {}
+
+            out: Dict[str, List[float]] = {}
+
+            # Multiple symbols → object with keys per symbol or "data" list
+            if isinstance(j, dict) and "data" in j and isinstance(j["data"], list):
+                for item in j["data"]:
+                    sym = item.get("symbol")
+                    values = item.get("values") or []
+                    closes = [float(v["close"]) for v in reversed(values) if "close" in v]  # oldest→newest
+                    out[sym] = closes
+            else:
+                # fallback: each key is a symbol
+                for sym in td_symbols:
+                    obj = j.get(sym) if isinstance(j, dict) else None
+                    if not obj or "values" not in obj:
+                        # Maybe error object
+                        if isinstance(obj, dict) and obj.get("status") == "error":
+                            logger.warning("%s %s: %s", sym, interval, obj)
+                        continue
+                    closes = [float(v["close"]) for v in reversed(obj["values"]) if "close" in v]
+                    out[sym] = closes
+
+            return out
+        except requests.HTTPError as e:
+            # 429 or others
+            txt = ""
+            try:
+                txt = r.text[:200]
+            except Exception:
+                pass
+            msg = f"{e} | {txt}"
+            if "429" in msg or "credits" in msg.lower():
+                if attempt < retries:
+                    logger.warning("Rate limited. Sleeping %ss then retry...", sleep_on_429)
+                    time.sleep(sleep_on_429)
+                    continue
+            logger.exception("HTTP error @%s: %s", interval, msg)
+            return {}
         except Exception as e:
-            logging.warning("Interval %s failed: %s", iv, e)
-            out[iv] = {}
-    return out
+            logger.exception("Fetch error @%s: %s", interval, e)
+            return {}
+        finally:
+            # safety pacing between intervals
+            time.sleep(1)
+    return {}
 
-def analyze(all_data: Dict[str, Dict[str, Any]], symbols: List[str]) -> Dict[str, Dict[str, str]]:
-    """Return {symbol_display: {interval: signal}}"""
-    results: Dict[str, Dict[str, str]] = {}
-    # Build reverse map from TD symbol to display key
-    rev_map = {normalize_symbol(k): k for k in symbols}
-    for iv, blob in all_data.items():
-        if not isinstance(blob, dict):
-            continue
-        for td_sym, series in blob.items():
-            # Handle API error object
-            if isinstance(series, dict) and series.get("status") == "error":
-                logging.warning("No data for %s %s: %s", td_sym, iv, series)
-                continue
-            # Some batch response nests as {"BTC/USD": {"meta":..., "values":[...] } }
-            values = None
-            if isinstance(series, dict) and "values" in series:
-                values = series["values"]
-            elif isinstance(series, dict) and td_sym in series and "values" in series[td_sym]:
-                values = series[td_sym]["values"]
-            if values is None:
-                continue
-            sig = decide_signal_from_candles(values)
-            key = rev_map.get(td_sym, td_sym)
-            results.setdefault(key, {})[iv] = sig
-    return results
-
-# ---------------- Telegram ----------------
-def telegram_send(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        logging.info("Telegram creds missing, print message instead:\n%s", text)
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
-    if USE_MD:
-        payload["parse_mode"] = "Markdown"
-    try:
-        r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        logging.info("Telegram: sent")
-    except Exception as e:
-        logging.exception("Telegram send fail: %s", e)
-
-# ---------------- Format message ----------------
-def format_report(analysis: Dict[str, Dict[str, str]]) -> str:
-    # Ordered display by our watchlist order
-    lines: List[str] = [f"{TITLE_PREFIX}",]
-    for sym in WATCH_SYMBOLS:
-        data = analysis.get(sym, {})
-        if not data:
-            continue
-        lines.append(f"==={sym.replace('USD','/USD')}===")
-        g = lambda iv: data.get(iv, "N/A")
-        # pairs
-        lines.append(f"15m-30m: {pair_text(g('15min'), g('30min'))}")
-        lines.append(f"1H-2H: {pair_text(g('1h'), g('2h'))}")
-        lines.append(f"4H-1D: {pair_text(g('4h'), g('1day'))}")
-        lines.append("")
-
-    lines.append(f"⏰ {now_vn().strftime('%Y-%m-%d %H:%M:%S')}")
-    return "\n".join(lines).strip()
-
-def pair_text(a: str, b: str) -> str:
-    if a == b:
+def combine_label(a: str, b: str, la: str, lb: str) -> str:
+    if a == b and a in ("LONG", "SHORT"):
         return a
     if a == "N/A" and b == "N/A":
         return "N/A"
-    return f"Mixed ({a},{b})"
+    return f"Mixed ({la}:{a}, {lb}:{b})"
 
-# ---------------- Main ----------------
+def send_telegram(text: str) -> None:
+    if not BOT_TOKEN or not CHAT_ID:
+        logger.info("No Telegram env; printing only.\n%s", text)
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        logger.info("Telegram: sent")
+    except Exception as e:
+        logger.exception("Telegram error: %s", e)
+
 def main():
-    logging.info("Start bot")
     if not TD_KEY:
-        raise RuntimeError("TWELVEDATA_API_KEY missing")
+        raise RuntimeError("Missing TD_KEY env")
 
-    data = fetch_all(WATCH_SYMBOLS)
-    analysis = analyze(data, WATCH_SYMBOLS)
-    msg = format_report(analysis)
-    logging.info("\n" + msg)
-    telegram_send(msg)
+    td_list = list(SYMBOLS.values())
+
+    # Fetch each interval in <=6 requests (under 8/min). Each request returns all symbols.
+    data_by_iv: Dict[str, Dict[str, List[float]]] = {}
+    for iv in INTERVALS:
+        data_by_iv[iv] = fetch_timeframe(iv, td_list)
+
+    # Build signals per symbol
+    report_lines: List[str] = []
+    any_trade_signal = False
+
+    header = [f"{TITLE}"]
+    ts = now_vn().strftime("%Y-%m-%d %H:%M:%S")
+    header.append(f"⏱ {ts}")
+    report_lines.extend(header)
+
+    for disp, td_sym in SYMBOLS.items():
+        iv_map = data_by_iv
+        sig_15 = classify(iv_map.get("15min", {}).get(td_sym, []))
+        sig_30 = classify(iv_map.get("30min", {}).get(td_sym, []))
+        sig_1h = classify(iv_map.get("1h", {}).get(td_sym, []))
+        sig_2h = classify(iv_map.get("2h", {}).get(td_sym, []))
+        sig_4h = classify(iv_map.get("4h", {}).get(td_sym, []))
+        sig_1d = classify(iv_map.get("1day", {}).get(td_sym, []))
+
+        # Determine if this symbol has any actionable signal
+        symbol_has_trade = any(s in ("LONG", "SHORT") for s in [sig_15, sig_30, sig_1h, sig_2h, sig_4h, sig_1d])
+        if not symbol_has_trade:
+            continue  # skip pure SIDEWAY/N/A symbols
+
+        any_trade_signal = True
+        report_lines.append("")
+        report_lines.append(f"==={disp}===")
+        report_lines.append(f"15m-30m: {combine_label(sig_15, sig_30, '15m', '30m')}")
+        report_lines.append(f"1h-2h:   {combine_label(sig_1h, sig_2h, '1h', '2h')}")
+        report_lines.append(f"4h-1D:   {combine_label(sig_4h, sig_1d, '4h', '1D')}")
+
+    if not any_trade_signal:
+        logger.info("All symbols SIDEWAY/N/A → skip Telegram.")
+        return
+
+    message = "\n".join(report_lines)
+    logger.info("Message:\n%s", message)
+    send_telegram(message)
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logging.exception("Fatal: %s", e)
-        try:
-            telegram_send(f"{TITLE_PREFIX}\n❌ ERROR: {e}")
-        except Exception:
-            pass
-        sys.exit(1)
+        logger.exception("Fatal: %s", e)
