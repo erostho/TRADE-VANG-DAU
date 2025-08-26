@@ -54,7 +54,7 @@ ASSETS = {
     "WTI Oil": "CL",            # fallback "WTI/USD" ở bên dưới
     "Bitcoin": "BTC/USD",
     "EUR/USD": "EUR/USD",
-    "ETHUSD: "Ethereum",
+    "ETHUSD": "Ethereum",
     "USD/JPY": "USD/JPY",
 }
 TD_INTERVAL = {"30m": "30min", "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1day"}
