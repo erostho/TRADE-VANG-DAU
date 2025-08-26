@@ -223,9 +223,9 @@ def main():
         any_trade_signal = True
         report_lines.append("")
         report_lines.append(f"==={disp}===")
-        report_lines.append(f"15m-30m: {combine_label(sig_15, sig_30, '15m', '30m')}")
-        report_lines.append(f"1h-2h:   {combine_label(sig_1h, sig_2h, '1h', '2h')}")
-        report_lines.append(f"4h-1D:   {combine_label(sig_4h, sig_1d, '4h', '1D')}")
+        report_lines.append(f"15m-30m: {combine_label(sig_15, sig_30)}")
+        report_lines.append(f"1h-2h:   {combine_label(sig_1h, sig_2h)}")
+        report_lines.append(f"4h-1D:   {combine_label(sig_4h, sig_1d)}")
 
     if not any_trade_signal:
         logger.info("All symbols SIDEWAY/N/A → skip Telegram.")
