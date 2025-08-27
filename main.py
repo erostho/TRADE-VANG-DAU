@@ -1,288 +1,307 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Main bot:
-- Fetch EACH timeframe separately from TwelveData (no resampling).
-- Intervals: 15m, 30m, 1h, 2h, 4h, 1day.
-- Pairs: BTC/USD, ETH/USD, XAU/USD (Gold), WTI Oil (CL or WTI/USD), EUR/USD, USD/JPY.
-- Rate limiting: default 7 requests/minute to stay under free 8 credits/min (configurable).
-- Only send Telegram when at least one timeframe has LONG/SHORT (not all SIDEWAY/N/A).
-- Output format:
+TwelveData-only Trend Scanner
+Frames: 30m, 1H, 2H, 4H, 1D
+Assets:
+  - XAU/USD (Gold) -> XAU/USD
+  - WTI Oil        -> CL   (fallback WTI/USD)
+  - Bitcoin        -> BTC/USD
+  - ETH/USD	   -> ETHUSDT
+  - USD/JPY        -> USD/JPY
 
-💵 TRADE GOODS
-⏱ 2025-08-26 15:16:15
+Output Telegram (ví dụ):
+===XAU/USD (Gold)===
+30m-1H: SIDEWAY
+2H-4H: LONG
+1D: LONG
 
-===Bitcoin===
-15m-30m: SIDEWAY - SIDEWAY
-1h-2h:   SIDEWAY - LONG
-4h-1D:   SHORT
+ENV (bắt buộc):
+  TWELVE_DATA_KEY
+  TELEGRAM_BOT_TOKEN
+  TELEGRAM_CHAT_ID
+ENV (tùy chọn):
+  LOG_LEVEL=INFO|DEBUG
+  INCLUDE_ERRORS_IN_TELEGRAM=1
+  TD_SLEEP_BETWEEN_CALL=8   # giây nghỉ giữa mỗi call để tránh 429
 """
 
-import os
-import time
-import math
-import logging
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Tuple, Optional
+import os, time, logging, requests
+import pandas as pd
+import numpy as np
 
-import requests
-
-# ---------- Config via ENV ----------
-TD_API_KEY = os.getenv("TD_API_KEY", "").strip()
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TZ_NAME = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+# ---------- ENV / LOG ----------
+TD_KEY   = os.getenv("TWELVE_DATA_KEY")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-# requests per minute cap (credits). keep <=7 to be safe on free tier (limit=8)
-RPM = int(os.getenv("TD_MAX_RPM", "7"))
-# how many candles to fetch per timeframe
-LIMIT = int(os.getenv("TD_LIMIT", "120"))
+INC_ERR_TG = os.getenv("INCLUDE_ERRORS_IN_TELEGRAM", "0") == "1"
+TD_SLEEP_BETWEEN_CALL = float(os.getenv("TD_SLEEP_BETWEEN_CALL", "8"))
+
+if not TD_KEY:
+    raise SystemExit("❌ Missing TWELVE_DATA_KEY")
+if not BOT_TOKEN or not CHAT_ID:
+    print("⚠️ Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID (vẫn chạy nhưng không gửi Telegram)")
 
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-TD_BASE = "https://api.twelvedata.com/time_series"
-HTTP_TIMEOUT = 30
-
-TITLE = "💵 TRADE GOODS"
-
-# ---------- Symbols & display names ----------
-PAIRS: Dict[str, List[str]] = {
-    "Bitcoin": ["BTC/USD", "BTCUSDT"],
+# ---------- CONFIG ----------
+ASSETS = {
+    "XAU/USD (Gold)": "XAU/USD",
+    "WTI Oil": "CL",            # fallback "WTI/USD" ở bên dưới
+    "Bitcoin": "BTC/USD",
     "Ethereum": ["ETH/USD", "ETHUSDT"],
-    "XAU/USD (Gold)": ["XAU/USD", "XAUUSD"],
-    "WTI Oil": ["WTI/USD", "CL=F", "USOIL", "CL"],
-    "EUR/USD": ["EUR/USD", "EURUSD"],
-    "USD/JPY": ["USD/JPY", "USDJPY"],
+    "USD/JPY": "USD/JPY",
 }
+TD_INTERVAL = {"30m": "30min", "1H": "1h", "2H": "2h", "4H": "4h", "1D": "1day"}
+OUTPUTSIZE = 2000
+# ---- Stronger filters / thresholds ----
+ADX_MIN = 22            # >20 trước đây
+ADX_RISING_BARS = 3     # ADX tăng liên tiếp N bar
+RSI_LONG = 55           # RSI ngưỡng LONG
+RSI_SHORT = 45          # RSI ngưỡng SHORT
+SLOPE_LOOKBACK = 5      # số bar để kiểm tra độ dốc EMA
+ATR_MIN_MULT = 0.002    # tối thiểu biến động: ATR / Close > 0.2% (lọc thị trường “đứng hình”)
+PERSIST_BARS = 2        # yêu cầu các điều kiện giữ ít nhất N bar (MACD hist, EMA alignment)
+CONF_THRESHOLD = 3      # điểm tối thiểu để coi là LONG/SHORT (xem scorer bên dưới)
+# Ngưỡng lọc / số nến tối thiểu
+MIN_BARS_INTRADAY = 60    # 30m/1H/2H/4H
+MIN_BARS_DAILY    = 120   # 1D
+ADX_TREND = 20
 
-FRAMES = ["15min", "30min", "1h", "2h", "4h", "1day"]
+# ---------- Indicators ----------
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
-# ---------- Utilities ----------
-def now_local() -> datetime:
-    # Simple TZ helper: use +7 if Asia/Ho_Chi_Minh
-    if TZ_NAME == "Asia/Ho_Chi_Minh":
-        return datetime.now(timezone(timedelta(hours=7)))
-    return datetime.now()
+def rsi(close, n=14):
+    d = close.diff()
+    gain, loss = d.clip(lower=0), (-d).clip(lower=0)
+    ag = gain.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    al = loss.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    rs = ag / al.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-def http_get(url: str, params: Dict) -> Dict:
-    r = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    j = r.json()
-    return j
+def macd(close, fast=12, slow=26, sig=9):
+    m = ema(close, fast) - ema(close, slow)
+    s = ema(m, sig)
+    return m, s, m - s
 
-# ---------- TwelveData fetch per timeframe ----------
-def td_fetch_series(symbol: str, interval: str) -> List[Dict]:
+def true_range(df):
+    pc = df["Close"].shift(1)
+    return pd.concat([(df["High"]-df["Low"]),
+                      (df["High"]-pc).abs(),
+                      (df["Low"]-df["Close"].shift(1)).abs()], axis=1).max(axis=1)
+
+def adx(df, n=14):
+    up, dn = df["High"].diff(), -df["Low"].diff()
+    plus  = up.where((up > dn) & (up > 0), 0.0)
+    minus = dn.where((dn > up) & (dn > 0), 0.0)
+    trn = true_range(df).rolling(n).sum()
+    pdi = 100 * (plus.rolling(n).sum() / trn)
+    mdi = 100 * (minus.rolling(n).sum() / trn)
+    dx  = ((pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)) * 100
+    return dx.rolling(n).mean()
+def bb_width(close, n=20):
+    ma = close.rolling(n).mean()
+    sd = close.rolling(n).std(ddof=0)
+    return ((ma + 2*sd) - (ma - 2*sd)) / ma
+
+def decorate(df):
+    out = df.copy()
+    out["EMA20"]  = ema(out["Close"], 20)
+    out["EMA50"]  = ema(out["Close"], 50)
+    out["EMA200"] = ema(out["Close"], 200)
+    out["RSI14"]  = rsi(out["Close"], 14)
+    out["MACD"], out["MACD_SIG"], out["MACD_HIST"] = macd(out["Close"])
+    out["ADX14"]  = adx(out, 14)
+    out["BBWIDTH"] = bb_width(out["Close"], 20)
+    return out
+
+def decide(df):
+    d = build_indicators(df)
+    label, _ = score_signal(d)
+    return label
+  
+def pct_slope(series, lookback=SLOPE_LOOKBACK):
+    if len(series) < lookback + 1: return 0.0
+    a, b = series.iloc[-1], series.iloc[-1-lookback]
+    return float((a-b)/b) if b else 0.0
+
+def atr(df, n=14):
+    return true_range(df).rolling(n).mean()
+
+def rising(series, n=3):
+    if len(series) < n+1: return False
+    x = series.tail(n+1)
+    return bool((x.diff().iloc[1:] > 0).all())
+
+def persist(cond_series, n=PERSIST_BARS):
+    if len(cond_series) < n: return False
+    return bool(cond_series.tail(n).all())
+
+def build_indicators(df):
+    d = decorate(df).copy()
+    d["ATR14"] = atr(d, 14)
+    d["ema_align_long"]  = (d["EMA20"] > d["EMA50"]) & (d["EMA50"] > d["EMA200"])
+    d["ema_align_short"] = (d["EMA20"] < d["EMA50"]) & (d["EMA50"] < d["EMA200"])
+    d["macd_bull"] = d["MACD"] > d["MACD_SIG"]
+    d["macd_bear"] = d["MACD"] < d["MACD_SIG"]
+    d["rsi_bull"]  = d["RSI14"] > RSI_LONG
+    d["rsi_bear"]  = d["RSI14"] < RSI_SHORT
+    d["adx_ok"]    = d["ADX14"] > ADX_MIN
+    return d
+
+def score_signal(d):
+    last = d.iloc[-1]
+    vol_ok = (last["ATR14"] / last["Close"]) > ATR_MIN_MULT
+    adx_up = rising(d["ADX14"], ADX_RISING_BARS)
+
+    ema_long_p = persist(d["ema_align_long"])
+    ema_short_p= persist(d["ema_align_short"])
+    macd_bull_p= persist(d["macd_bull"])
+    macd_bear_p= persist(d["macd_bear"])
+
+    slope50_pos = pct_slope(d["EMA50"])  > 0
+    slope200_pos= pct_slope(d["EMA200"]) > 0
+    slope50_neg = pct_slope(d["EMA50"])  < 0
+    slope200_neg= pct_slope(d["EMA200"]) < 0
+
+    long_score = 0
+    if ema_long_p: long_score += 1
+    if last["rsi_bull"]: long_score += 1
+    if macd_bull_p: long_score += 1
+    if last["adx_ok"] and adx_up: long_score += 1
+    if slope50_pos and slope200_pos: long_score += 1
+    if vol_ok: long_score += 1
+
+    short_score = 0
+    if ema_short_p: short_score += 1
+    if last["rsi_bear"]: short_score += 1
+    if macd_bear_p: short_score += 1
+    if last["adx_ok"] and adx_up: short_score += 1
+    if slope50_neg and slope200_neg: short_score += 1
+    if vol_ok: short_score += 1
+
+    if long_score >= CONF_THRESHOLD and long_score > short_score:
+        return "LONG", long_score
+    if short_score >= CONF_THRESHOLD and short_score > long_score:
+        return "SHORT", short_score
+    return "SIDEWAY", max(long_score, short_score)
+# ---------- TwelveData: single call (retry + throttle) ----------
+def td_single_time_series(symbol: str, interval: str, outputsize=OUTPUTSIZE, retries=2):
     """
-    Fetch time series for a symbol at given interval. Returns list of bars newest->oldest.
+    interval: '30min','1h','2h','4h','1day'
+    Trả về DataFrame OHLC (index = datetime). Tự nghỉ giữa các call để tránh 429.
     """
-    if not TD_API_KEY:
-        raise RuntimeError("Missing TD_API_KEY env")
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": LIMIT,
-        "format": "JSON",
-        "apikey": TD_API_KEY,
-        "dp": 8,
-        "timezone": "UTC",
-        "order": "desc",
-    }
-    try:
-        j = http_get(TD_BASE, params)
-    except Exception as e:
-        raise RuntimeError(f"HTTP fail {symbol} {interval}: {e}")
-
-    # Handle errors from API
-    if isinstance(j, dict) and j.get("status") == "error":
-        code = str(j.get("code"))
-        msg = j.get("message", "")
-        # Rate limit 429: wait and retry once
-        if code == "429":
-            logging.warning("Rate limit hit. Sleeping 65s then retry: %s %s", symbol, interval)
-            time.sleep(65)
-            j = http_get(TD_BASE, params)
-            if isinstance(j, dict) and j.get("status") == "error":
-                raise RuntimeError(f"TD error after retry {symbol} {interval}: {j}")
-        else:
-            raise RuntimeError(f"TD error {symbol} {interval}: {j}")
-
-    data = j.get("values") if isinstance(j, dict) else None
-    if not data:
-        raise RuntimeError(f"No data {symbol}-{interval}: {j}")
-    return data  # newest first
-
-# ---------- Throttler ----------
-class Throttler:
-    """
-    Simple rpm throttler: ensure <= RPM requests per 60 seconds.
-    """
-    def __init__(self, rpm: int):
-        self.rpm = max(1, rpm)
-        self.window_start = time.time()
-        self.count = 0
-
-    def hit(self):
-        now = time.time()
-        # reset window after 60s
-        if now - self.window_start >= 60:
-            self.window_start = now
-            self.count = 0
-        # if would exceed, sleep the remaining time
-        if self.count >= self.rpm:
-            wait = 60 - (now - self.window_start)
-            if wait > 0:
-                logging.info("Throttle: sleeping %.1fs to respect RPM=%s", wait, self.rpm)
+    url = "https://api.twelvedata.com/time_series"
+    params = {"symbol": symbol, "interval": interval, "outputsize": outputsize, "apikey": TD_KEY}
+    last_err = None
+    for attempt in range(retries + 1):
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code == 429:
+            wait = 65 if attempt < retries else 0
+            logging.warning(f"TD 429 for {symbol} {interval}, backoff {wait}s (attempt {attempt+1}/{retries+1})")
+            if wait:
                 time.sleep(wait)
-            self.window_start = time.time()
-            self.count = 0
-        self.count += 1
-
-throttler = Throttler(RPM)
-
-# ---------- Signal logic per timeframe ----------
-def decide_signal(values: List[Dict]) -> str:
-    """
-    Decide LONG/SHORT/SIDEWAY from OHLC list (newest first).
-    Rule (simple & robust):
-      - Compute ema20 on close (reverse to old->new first).
-      - slope = ema[-1] - ema[-6] (approx over 5 bars)
-      - price position vs ema:
-          up if slope>0 and close[-1] > ema[-1]
-          down if slope<0 and close[-1] < ema[-1]
-          else SIDEWAY
-    """
-    if not values or len(values) < 25:
-        return "N/A"
-    # reverse
-    closes = [float(x["close"]) for x in values[::-1]]
-    # ema20
-    k = 2 / (20 + 1)
-    ema = []
-    e = closes[0]
-    for c in closes:
-        e = c * k + e * (1 - k)
-        ema.append(e)
-    slope = ema[-1] - ema[-6] if len(ema) >= 6 else ema[-1] - ema[0]
-    last_close = closes[-1]
-    last_ema = ema[-1]
-    if slope > 0 and last_close > last_ema:
-        return "LONG"
-    if slope < 0 and last_close < last_ema:
-        return "SHORT"
-    return "SIDEWAY"
-
-# ---------- Try a list of tickers for one label ----------
-def get_best_symbol(label: str) -> Optional[str]:
-    for s in PAIRS.get(label, []):
-        return s
-    return None
-
-def analyze_one(label: str) -> Dict[str, str]:
-    """
-    For one instrument label, fetch EACH timeframe separately.
-    Return dict interval->signal.
-    """
-    symbols = PAIRS.get(label, [])
-    if not symbols:
-        return {}
-    signals: Dict[str, str] = {}
-    # Try each candidate symbol until success for a given interval
-    for iv in FRAMES:
-        got = False
-        for sym in symbols:
-            try:
-                throttler.hit()
-                vals = td_fetch_series(sym, iv)
-                sig = decide_signal(vals)
-                signals[iv] = sig
-                got = True
-                break
-            except Exception as e:
-                logging.warning("No data for %s-%s: %s", sym, iv, e)
                 continue
-        if not got:
-            signals[iv] = "N/A"
-    return signals
+        try:
+            r.raise_for_status()
+            js = r.json()
+            if "values" not in js or not js["values"]:
+                raise RuntimeError(f"empty payload: {js}")
+            df = pd.DataFrame(js["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.sort_values("datetime").set_index("datetime")
+            df = df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"})
+            df[["Open","High","Low","Close"]] = df[["Open","High","Low","Close"]].astype(float)
+            if "Volume" in df.columns:
+                df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+            logging.info(f"TD OK {symbol} {interval}: {len(df)} rows [{df.index[0]}..{df.index[-1]}]")
+            time.sleep(TD_SLEEP_BETWEEN_CALL)  # throttle
+            return df
+        except Exception as e:
+            last_err = e
+            logging.warning(f"TD fail {symbol} {interval}: {e}")
+            time.sleep(TD_SLEEP_BETWEEN_CALL)
+    raise RuntimeError(f"TD final fail {symbol} {interval}: {last_err}")
 
 # ---------- Telegram ----------
-def send_telegram(text: str):
+def send_tele(text: str):
     if not BOT_TOKEN or not CHAT_ID:
-        logging.info("Telegram disabled (missing env).")
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        logging.info("Telegram: sent")
+        full_message = "💵 TRADE GOODS\n" + text
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": full_message},
+            timeout=20
+        )
     except Exception as e:
-        logging.exception("Telegram error: %s", e)
-
-# ---------- Format message ----------
-def fmt_block(label: str, sigs: Dict[str, str]) -> str:
-    # map frames
-    s15 = sigs.get("15min", "N/A")
-    s30 = sigs.get("30min", "N/A")
-    s1h = sigs.get("1h", "N/A")
-    s2h = sigs.get("2h", "N/A")
-    s4h = sigs.get("4h", "N/A")
-    s1d = sigs.get("1day", "N/A")
-
-    lines = []
-    lines.append(f"==={label}===")
-    lines.append(f"15m-30m: {s15} - {s30}")
-    lines.append(f"1h-2h:   {s1h} - {s2h}")
-    # if 4h and 1D same, show single; else show both
-    if s4h == s1d:
-        lines.append(f"4h-1D:   {s4h}")
-    else:
-        lines.append(f"4h-1D:   {s4h} - {s1d}")
-    return "\n".join(lines)
-
-def all_sideway(blocks: Dict[str, Dict[str, str]]) -> bool:
-    # Return True if all intervals for all labels are SIDEWAY or N/A
-    for sigs in blocks.values():
-        for v in sigs.values():
-            if v in ("LONG", "SHORT"):
-                return False
-    return True
+        logging.exception(f"Telegram error: {e}")
 
 # ---------- Main ----------
 def main():
-    logging.info("Start")
-    results: Dict[str, Dict[str, str]] = {}
-    for label in PAIRS.keys():
-        try:
-            sigs = analyze_one(label)
-            results[label] = sigs
-        except Exception as e:
-            logging.exception("Analyze fail %s: %s", label, e)
-            results[label] = {}
+    reports = []
+    any_signal = False  # chỉ gửi khi có ít nhất 1 LONG/SHORT
 
-    if all_sideway(results):
-        logging.info("All SIDEWAY/N/A -> skip Telegram")
-        return
+    for display, base_symbol in ASSETS.items():
+        logging.info(f"=== Start {display} ({base_symbol}) ===")
+        notes = []
+        # fallback riêng cho dầu
+        sym_candidates = [base_symbol] if base_symbol != "CL" else ["CL", "WTI/USD"]
 
-    t = now_local().strftime("%Y-%m-%d %H:%M:%S")
-    lines = [TITLE, f"⏱ {t}", ""]
-    for label in results.keys():
-        lines.append(fmt_block(label, results[label]))
-        lines.append("")
-    msg = "\n".join(lines).rstrip()
-    logging.info("Message:\n%s", msg)
-    send_telegram(msg)
+        # 1) Lấy dữ liệu từng khung
+        frames = {}
+        for lbl, iv in TD_INTERVAL.items():   # TD_INTERVAL: {"30m":"30min", "1H":"1h", "2H":"2h", "4H":"4h", "1D":"1day"}
+            df = None
+            for sym in sym_candidates:
+                try:
+                    df = td_single_time_series(sym, iv)
+                    break
+                except Exception as e:
+                    logging.warning(f"Try {sym} {iv} fail: {e}")
+            frames[lbl] = df
+            if df is None:
+                notes.append(f"{lbl} ERR")
+
+        # 2) Hàm tính tín hiệu cho từng khung
+        def sig(df, is_daily=False):
+            need = MIN_BARS_DAILY if is_daily else MIN_BARS_INTRADAY
+            if isinstance(df, pd.DataFrame) and len(df) >= need:
+                return decide(decorate(df))
+            return "N/A"
+
+        # 3) Tín hiệu từng khung
+        s30 = sig(frames.get("30m"))
+        s1h = sig(frames.get("1H"))
+        s2h = sig(frames.get("2H"))
+        s4h = sig(frames.get("4H"))
+        s1d = sig(frames.get("1D"), is_daily=True)
+
+        # 5) Ghép message theo format yêu cầu
+        line_short = s30 if (s30 == s1h and s30 != "N/A") else f"Mixed (30m:{s30}, 1H:{s1h})"
+        line_mid   = s2h if (s2h == s4h and s2h != "N/A") else f"Mixed (2H:{s2h}, 4H:{s4h})"
+        msg = f"==={display}===\n30m-1H: {line_short}\n2H-4H: {line_mid}\n1D: {s1d}"
+
+        if INC_ERR_TG and notes:
+            msg += f"\n⚠ thiếu dữ liệu: {', '.join(notes)}"
+
+        logging.info(msg.replace("\n", " | "))
+
+        # 6) Chỉ add khi có LONG/SHORT ở bất kỳ khung nào
+        if any(x in ("LONG", "SHORT") for x in [s30, s1h, s2h, s4h, s1d]):
+            reports.append(msg)
+            any_signal = True
+        else:
+            logging.info(f"{display}: all SIDEWAY/N/A -> skip")
+
+    # 7) Gửi Telegram nếu có tín hiệu
+    if any_signal:
+        send_tele("\n\n".join(reports))
+    else:
+        logging.info("No trade signals (LONG/SHORT). Telegram not sent.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logging.exception("Fatal: %s", e)
-        try:
-            send_telegram(f"{TITLE}\n❌ ERROR: {e}")
-        except Exception:
-            pass
-        raise
+    main()
