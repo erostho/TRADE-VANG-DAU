@@ -145,7 +145,7 @@ def main():
         for group, trend in results.items():
             lines.append(f"{group}: {trend}")
         if entry and sl and tp:
-            lines.append(f"1H plan: {plan} | Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
+            lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
         lines.append("")
     msg = "\n".join(lines)
     send_telegram(msg)
