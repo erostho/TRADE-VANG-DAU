@@ -138,14 +138,14 @@ def main():
     lines = []
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     lines.append("💵 TRADE GOODS")
-    lines.append(f"⏱ {now}\\n")
+    lines.append(f"⏱ {now}\n")
     for name, sym in symbols.items():
         results, plan, entry, sl, tp, atrval = analyze_symbol(name, sym)
         lines.append(f"==={name}===")
         for group, trend in results.items():
             lines.append(f"{group}: {trend}")
         if entry and sl and tp:
-            lines.append(f"1H plan: {plan} | Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} (ATR14 {atrval:.3f})")
+            lines.append(f"1H plan: {plan} | Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
         lines.append("")
     msg = "\n".join(lines)
     send_telegram(msg)
