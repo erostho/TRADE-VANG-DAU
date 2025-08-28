@@ -29,8 +29,8 @@ symbols = {
     "Bitcoin": "BTC/USD",
     "Ethereum": "ETH/USD",
     "XAU/USD (Gold)": "XAU/USD",
+    "WTI Oil": "CL",
     "USD/JPY": "USD/JPY",
-    # "WTI Oil": "WTI/USD"   # free plan thường không có -> comment
 }
 
 interval_groups = {
