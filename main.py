@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 
 # ================= CONFIG =================
-API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
+API_KEY = os.getenv("TWELVE_DATA_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
