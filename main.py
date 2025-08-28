@@ -147,7 +147,7 @@ def main():
         if entry and sl and tp:
             lines.append(f"1H plan: {plan} | Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f} (ATR14 {atrval:.3f})")
         lines.append("")
-    msg = "\\n".join(lines)
+    msg = "\n".join(lines)
     send_telegram(msg)
 
 if __name__ == "__main__":
