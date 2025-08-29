@@ -1,338 +1,359 @@
-# main.py
-import os, json, time, math, logging, requests, datetime as dt
-from typing import Dict, Tuple, List
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# ============ CONFIG ============
-API_KEY = os.getenv("TWELVE_DATA_KEY", "")
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
-TIMEZ    = os.getenv("TZ", "Asia/Ho_Chi_Minh")
-RPM      = int(os.getenv("RPM", "7"))            # tối đa request/phút (<= 7 để an toàn free plan)
-BASE_URL = "https://api.twelvedata.com/time_series"
+import os, sys, json, time, math, logging, datetime as dt
+from typing import Dict, Any, List, Tuple, Optional
+import urllib.parse, urllib.request
 
-# Lấy nến gần nhất (không đợi đóng)
-FETCH_LIVE = True
-
-# Symbols (hiển thị -> mã TwelveData)
-symbols = {
-    "Bitcoin": "BTC/USD",
-    "Ethereum": "ETH/USD",
-    "XAU/USD (Gold)": "XAU/USD",
-    "WTI Oil": "CL",
-    "USD/JPY": "USD/JPY",
-}
-
-# Các khung cần theo dõi
-I_30M, I_1H, I_2H, I_4H, I_1D = "30min", "1h", "2h", "4h", "1day"
-
-# File lưu cache/state
-STATE_FILE = "state.json"      # lưu round-robin + cache
-TIMEOUT_S  = 15
-
-# ============ LOG ============
+# ============== LOG ==============
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("main")
 
-# ============ STATE (RR + CACHE) ============
-def _now_vn() -> dt.datetime:
-    # không có pytz: dùng offset VN +7
-    return dt.datetime.utcnow() + dt.timedelta(hours=7)
+# ============== CONFIG ==============
+API_KEY          = os.getenv("TWELEVE_DATA_KEY", "") or os.getenv("TWELVE_DATA_KEY", "")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BASE_URL         = "https://api.twelvedata.com/time_series"
+TZ_NAME          = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+RPM              = int(os.getenv("RPM", "7"))  # max calls per minute
+REDIS_URL        = os.getenv("REDIS_URL", "")
 
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
+# Hiển thị -> API symbol (CHỈ value được dùng gọi API & cache)
+SYMBOLS: Dict[str, str] = {
+    "Bitcoin":         "BTC/USD",
+    "Ethereum":        "ETH/USD",
+    "XAU/USD (Gold)":  "XAU/USD",
+    "WTI Oil":         "WTI/USD",   # nếu rỗng hãy thử "WTICO/USD"
+    "USD/JPY":         "USD/JPY",
+}
+
+# nhóm khung – để render dòng gọn
+PAIR_GROUPS: List[Tuple[str,str]] = [("30min","1h"), ("2h","4h")]
+DAILY_TF = "1day"
+
+# ============== TZ ==============
+try:
+    import zoneinfo
+    VN_TZ = zoneinfo.ZoneInfo(TZ_NAME)
+except Exception:
+    # fallback UTC+7
+    class _Fixed(dt.tzinfo):
+        def utcoffset(self, _): return dt.timedelta(hours=7)
+        def tzname(self, _): return "UTC+7"
+        def dst(self, _): return dt.timedelta(0)
+    VN_TZ = _Fixed()
+
+def now_vn() -> dt.datetime:
+    return dt.datetime.now(VN_TZ)
+
+# ============== CACHE ==============
+class CacheIF:
+    def get(self, k: str) -> Any: ...
+    def set(self, k: str, v: Any, ex: int = None) -> None: ...
+
+class FileCache(CacheIF):
+    def __init__(self, path="/tmp/cache.json"):
+        self.path = path
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(self.path, "r", encoding="utf-8") as f:
+                self.data = json.load(f)
+        except Exception:
+            self.data = {}
+    def _flush(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f)
         except Exception:
             pass
-    # default state
-    rr = []  # hàng đợi round-robin
-    for name in symbols.keys():
-        rr += [(name, I_30M), (name, I_1H), (name, I_2H), (name, I_4H)]
-    return {
-        "rr": rr,              # hàng đợi còn lại lần chạy hiện tại
-        "cursor": 0,           # con trỏ vòng lặp
-        "cache": {},           # {(symbol, interval): {"trend": "...", "ts": "...", "entry":..., "sl":..., "tp":... (chỉ 1h)}}
-        "daily": {"dateVN": "", "data": {}},  # 1D lưu theo ngày VN (YYYY-MM-DD)
-    }
+    def get(self, k):
+        item = self.data.get(k)
+        if not item: return None
+        if "exp" in item and item["exp"] and time.time() > item["exp"]:
+            self.data.pop(k, None)
+            self._flush()
+            return None
+        return item["val"]
+    def set(self, k, v, ex=None):
+        exp = time.time() + ex if ex else None
+        self.data[k] = {"val": v, "exp": exp}
+        self._flush()
 
-def save_state(st: dict):
+_cache: CacheIF
+if REDIS_URL:
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False)
+        import redis
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        class RedisCache(CacheIF):
+            def get(self, k):
+                s = r.get(k)
+                return json.loads(s) if s else None
+            def set(self, k, v, ex=None):
+                r.set(k, json.dumps(v), ex=ex)
+        _cache = RedisCache()
+        log.info("Cache: Redis")
     except Exception as e:
-        log.warning("Cannot save state: %s", e)
+        log.warning("Redis not available, fallback to file cache: %s", e)
+        _cache = FileCache()
+else:
+    _cache = FileCache()
 
-# ============ TwelveData fetch ============
-def fetch_series(symbol_code: str, interval: str) -> Tuple[List[dict], dict]:
-    """
-    Trả về (list_values_desc, last_bar)
-    values: order=desc (mới -> cũ)
-    last_bar: nến gần nhất (có thể đang chạy)
-    """
-    need = 60 if interval == I_1H else 50
+def api_symbol(display_name: str) -> str:
+    return SYMBOLS[display_name]
+
+def cache_key(api_sym: str, tf: str) -> str:
+    return f"{api_sym}:{tf}"
+
+def store(k: str, v: Any, ttl: int):
+    _cache.set(k, v, ex=ttl)
+
+def load(k: str) -> Any:
+    return _cache.get(k)
+
+# ============== HTTP helper ==============
+def http_get(url: str, params: Dict[str, str]) -> Dict[str, Any]:
+    q = urllib.parse.urlencode(params)
+    full = f"{url}?{q}"
+    req = urllib.request.Request(full, headers={"User-Agent":"Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        text = resp.read().decode("utf-8", "ignore")
+    return json.loads(text)
+
+# ============== DATA / INDICATORS ==============
+def fetch_series(symbol_api: str, interval: str, outputsize: int=120) -> Optional[List[Dict[str, Any]]]:
     params = {
-        "symbol": symbol_code,
+        "symbol": symbol_api,
         "interval": interval,
-        "outputsize": max(need, 2),
-        "order": "desc",
-        "timezone": TIMEZ,
         "apikey": API_KEY,
+        "outputsize": str(outputsize),
+        "order": "desc",
+        "format": "JSON",
+        "dp": "8",
     }
-    r = requests.get(BASE_URL, params=params, timeout=TIMEOUT_S)
-    r.raise_for_status()
-    js = r.json()
-    if "values" not in js:
-        raise RuntimeError(f"TD no values: {js}")
-    values = js["values"]
-    if not values:
-        raise RuntimeError("TD empty values")
-    last_bar = values[0]
-    return values, last_bar
-
-# ============ TA helpers ============
-def to_float(x) -> float:
     try:
-        return float(x)
-    except Exception:
-        return float("nan")
+        data = http_get(BASE_URL, params)
+    except Exception as e:
+        log.warning("HTTP fail %s %s: %s", symbol_api, interval, e)
+        return None
 
-def calc_atr(values_desc: List[dict], period: int = 14) -> float:
-    """values_desc: list mới->cũ"""
-    # chuyển sang cũ->mới cho dễ tính
-    vals = list(reversed(values_desc))
-    trs = []
-    prev_close = None
+    if isinstance(data, dict) and data.get("status") == "error":
+        log.warning("TD error %s %s: %s", symbol_api, interval, data)
+        return None
+
+    vals = data.get("values")
+    if not vals: 
+        return None
+
+    # normalize to floats
     for v in vals:
-        high = to_float(v["high"])
-        low  = to_float(v["low"])
-        close = to_float(v["close"])
-        if math.isnan(high) or math.isnan(low) or math.isnan(close):
-            continue
-        if prev_close is None:
-            tr = high - low
-        else:
-            tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        for k in ("open","high","low","close"):
+            v[k] = float(v[k])
+    return vals  # newest first
+
+def sma(seq: List[float], n: int) -> float:
+    n = min(n, len(seq))
+    return sum(seq[:n]) / max(n,1)
+
+def atr14(ohlc: List[Dict[str,Any]]) -> float:
+    # expects newest first
+    n = min(15, len(ohlc))
+    if n < 15:
+        return None
+    trs = []
+    prev_close = ohlc[::-1][0]["close"]  # oldest close
+    for x in ohlc[::-1][1:15]:           # 14 periods
+        high, low = x["high"], x["low"]
+        tr = max(high-low, abs(high-prev_close), abs(low-prev_close))
         trs.append(tr)
-        prev_close = close
-    if len(trs) < period:
-        return float("nan")
-    return sum(trs[-period:]) / period
+        prev_close = x["close"]
+    return sum(trs)/len(trs) if trs else None
 
-def sma(closes: List[float], n: int) -> float:
-    if len(closes) < n:
-        return float("nan")
-    return sum(closes[-n:]) / n
-
-def detect_trend(values_desc: List[dict]) -> str:
-    """Trend đơn giản: SMA20 vs SMA50 + hướng close gần nhất"""
-    closes = [to_float(v["close"]) for v in reversed(values_desc)]
-    if len(closes) < 50:
+def infer_trend(ohlc: List[Dict[str,Any]]) -> str:
+    # dùng SMA(5) vs SMA(20) – đủ ổn định, sideway nếu chênh < 0.05%
+    closes = [x["close"] for x in ohlc]
+    if len(closes) < 20:
         return "N/A"
-    s20 = sma(closes, 20)
-    s50 = sma(closes, 50)
-    if math.isnan(s20) or math.isnan(s50):
-        return "N/A"
-    if s20 > s50 * 1.001:
+    s5, s20 = sma(closes,5), sma(closes,20)
+    if s20 == 0: return "N/A"
+    diff = (s5 - s20)/s20
+    if diff > 0.0005:   # >0.05%
         return "LONG"
-    if s20 < s50 * 0.999:
+    if diff < -0.0005:
         return "SHORT"
     return "SIDEWAY"
 
-# ============ Round-robin pick ============
-def build_rr_list() -> List[Tuple[str, str]]:
-    rr = []
-    for name in symbols.keys():
-        rr += [(name, I_30M), (name, I_1H), (name, I_2H), (name, I_4H)]
-    return rr
+def compute_plan_1h(ohlc_1h: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
+    if not ohlc_1h: return None
+    trend = infer_trend(ohlc_1h)
+    if trend not in ("LONG","SHORT"):
+        return None
+    entry = ohlc_1h[0]["close"]  # last close (newest first)
+    a14 = atr14(ohlc_1h)
+    if not a14 or a14 <= 0: 
+        return None
+    if trend == "LONG":
+        sl = entry - a14
+        tp = entry + a14
+    else:
+        sl = entry + a14
+        tp = entry - a14
+    return {"trend":"", "entry":entry, "sl":sl, "tp":tp, "atr":a14}
 
-def pick_batch(st: dict, limit: int) -> List[Tuple[str, str]]:
-    rr = st.get("rr") or []
-    cur = st.get("cursor", 0)
-    if not rr:
-        rr = build_rr_list()
-        cur = 0
-    batch = []
-    for _ in range(limit):
-        pair = rr[cur % len(rr)]
-        batch.append(pair)
-        cur += 1
-    st["rr"] = rr
-    st["cursor"] = cur
-    return batch
+# ============== ROUND-ROBIN ==============
+def make_rr_list() -> List[Tuple[str,str]]:
+    lst = []
+    for name in SYMBOLS.keys():
+        for tf in ["30min","1h","2h","4h"]:
+            lst.append((name, tf))
+    return lst
 
-# ============ Business rules ============
-def update_interval_cache(st: dict, disp_name: str, interval: str):
-    code = symbols[disp_name]
+def rr_index_key() -> str:
+    return "rr:index"
+
+def rr_next_batch(limit: int) -> List[Tuple[str,str]]:
+    all_pairs = make_rr_list()
+    idx = load(rr_index_key()) or 0
+    out = []
+    for i in range(limit):
+        out.append(all_pairs[(idx+i) % len(all_pairs)])
+    store(rr_index_key(), (idx+limit) % len(all_pairs), ex=24*3600)
+    return out
+
+# ============== FETCH/STORE HELPERS ==============
+def get_or_fetch(api_sym: str, tf: str, ttl: int) -> Optional[Dict[str,Any]]:
+    k = cache_key(api_sym, tf)
+    val = load(k)
+    if val:
+        return val
+    series = fetch_series(api_sym, tf)
+    if not series: 
+        return None
+    # build tiny payload: trend + last_close + maybe ATR (for 1h)
+    payload = {
+        "trend": infer_trend(series),
+        "last": series[0]["close"],
+    }
+    if tf == "1h":
+        p1 = compute_plan_1h(series)
+        if p1:
+            payload.update({
+                "entry": p1["entry"],
+                "sl": p1["sl"],
+                "tp": p1["tp"],
+                "atr": p1["atr"],
+            })
+    # TTL: 30m=25m, 1h=50m, 2h=110m, 4h=230m, 1day=26h
+    tf_ttl = {
+        "30min": 25*60, "1h": 50*60, "2h": 110*60, "4h": 230*60, "1day": 26*3600
+    }.get(tf, 3600)
+    store(k, payload, tf_ttl)
+    return payload
+
+# ============== TELEGRAM ==============
+def telegram_send(text: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("Telegram disabled (missing env)")
+        return
     try:
-        values, last_bar = fetch_series(code, interval)
-        trend = detect_trend(values)
-
-        # update cache
-        key = f"{disp_name}|{interval}"
-        entry = st["cache"].get(key, {})
-        entry.update({
-            "trend": trend,
-            "ts": _now_vn().isoformat(timespec="seconds"),
-        })
-
-        # Tính Entry/SL/TP cho 1H nếu có
-        if interval == I_1H and trend in ("LONG", "SHORT"):
-            close = to_float(last_bar["close"])
-            atr = calc_atr(values, 14)
-            if not math.isnan(close) and not math.isnan(atr):
-                if trend == "LONG":
-                    sl = close - atr
-                    tp = close + atr
-                else:
-                    sl = close + atr
-                    tp = close - atr
-                entry["entry"] = round(close, 2)
-                entry["sl"]    = round(sl, 2)
-                entry["tp"]    = round(tp, 2)
-            else:
-                entry.pop("entry", None); entry.pop("sl", None); entry.pop("tp", None)
-        st["cache"][key] = entry
-
-    except requests.HTTPError as e:
-        log.warning("TD HTTP %s for %s %s", e, disp_name, interval)
+        api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        req = urllib.request.Request(api, data=urllib.parse.urlencode(data).encode("utf-8"))
+        urllib.request.urlopen(req, timeout=15).read()
+        log.info("Telegram: sent")
     except Exception as e:
-        log.warning("Update fail %s %s: %s", disp_name, interval, e)
+        log.warning("Telegram send fail: %s", e)
 
-def update_daily_if_needed(st: dict):
-    today_vn = _now_vn().strftime("%Y-%m-%d")
-    is_7am_window = _now_vn().hour == 7  # chạy ở phút nào cũng được trong giờ 7
-    # nếu đã có cùng ngày thì không fetch lại
-    if st["daily"].get("dateVN") == today_vn:
-        return
-    if not is_7am_window:
-        return
-    data = {}
-    for name, code in symbols.items():
-        try:
-            vals, _ = fetch_series(code, I_1D)
-            data[name] = detect_trend(vals)
-            time.sleep(max(0, 60.0 / RPM / 2))  # nương tay
-        except Exception as e:
-            log.warning("Daily fetch fail %s: %s", name, e)
-    if data:
-        st["daily"]["dateVN"] = today_vn
-        st["daily"]["data"] = data
+# ============== MAIN CYCLE ==============
+def fetch_daily_if_7am():
+    now = now_vn()
+    # chỉ fetch trong phút 0–1 để tránh spam
+    if now.hour == 7 and now.minute <= 1:
+        for disp, api_sym in SYMBOLS.items():
+            get_or_fetch(api_sym, DAILY_TF, ttl=26*3600)
 
-def get_cached(st: dict, name: str, interval: str) -> str:
-    key = f"{name}|{interval}"
-    item = st["cache"].get(key)
-    if item and item.get("trend"):
-        return item["trend"]
-    return "N/A"
+def throttled_round_robin():
+    # mỗi lần chạy chỉ gọi tối đa (RPM) cái; trừ hao 1–2 cho fallback
+    budget = max(1, RPM - 1)
+    batch = rr_next_batch(budget)
+    log.info("Batch: %s", batch)
+    used = 0
+    for disp, tf in batch:
+        api_sym = api_symbol(disp)
+        # chỉ fetch khi nến "gần đóng" để giảm noise
+        # (nhưng vẫn cache nếu chưa có)
+        get_or_fetch(api_sym, tf, ttl=3600)
+        used += 1
+    return used
 
-def get_1h_plan_line(st: dict, name: str) -> str:
-    key = f"{name}|{I_1H}"
-    item = st["cache"].get(key) or {}
-    trend = item.get("trend")
-    if trend in ("LONG", "SHORT") and all(k in item for k in ("entry","sl","tp")):
-        return f"Entry {item['entry']} | SL {item['sl']} | TP {item['tp']}"
-    return ""  # SIDEWAY hoặc chưa đủ dữ liệu -> không in
-
-# ============ Telegram ============
-def tg_send(text: str):
-    if not (TG_TOKEN and TG_CHAT):
-        log.info("Telegram skipped (no token/chat)")
-        return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT, "text": text}
-    try:
-        r = requests.post(url, json=payload, timeout=TIMEOUT_S)
-        if r.status_code != 200:
-            log.warning("Telegram send failed: %s %s", r.status_code, r.text)
+def render_message() -> str:
+    now = now_vn().strftime("%Y-%m-%d %H:%M:%S (VN)")
+    lines = []
+    lines.append("💵 TRADE GOODS")
+    lines.append(f"🕰 {now}")
+    lines.append("")
+    for disp in SYMBOLS.keys():
+        api_sym = api_symbol(disp)
+        lines.append(f"==={disp}===")
+        # group 30m-1h
+        g1_vals = []
+        g1_show = []
+        for tf in ["30min","1h"]:
+            v = load(cache_key(api_sym, tf))
+            if not v:
+                v = get_or_fetch(api_sym, tf, ttl=3600)  # fallback 1 lần
+            trend = v.get("trend") if v else "N/A"
+            g1_vals.append(trend)
+            g1_show.append(f"{tf.replace('min','m')}:{trend}")
+        if g1_vals[0] == g1_vals[1] and g1_vals[0] in ("LONG","SHORT","SIDEWAY"):
+            lines.append(f"30m–1H: {g1_vals[0]}")
         else:
-            log.info("Telegram: sent")
-    except Exception as e:
-        log.warning("Telegram error: %s", e)
+            lines.append(f"30m–1H: Mixed ({', '.join(g1_show)})")
 
-# ============ Compose message ============
-def combine_pair(a: str, b: str, label_a: str, label_b: str) -> str:
-    if a == "N/A" and b == "N/A":
-        return "N/A"
-    if a == b:
-        return a
-    return f"Mixed ({label_a}:{a}, {label_b}:{b})"
+        # group 2h-4h
+        g2_vals = []
+        g2_show = []
+        for tf in ["2h","4h"]:
+            v = load(cache_key(api_sym, tf))
+            if not v:
+                v = get_or_fetch(api_sym, tf, ttl=7200)
+            trend = v.get("trend") if v else "N/A"
+            g2_vals.append(trend)
+            g2_show.append(f"{tf}:{trend}")
+        if g2_vals[0] == g2_vals[1] and g2_vals[0] in ("LONG","SHORT","SIDEWAY"):
+            lines.append(f"2H–4H: {g2_vals[0]}")
+        else:
+            lines.append(f"2H–4H: Mixed ({', '.join(g2_show)})")
 
-def build_message(st: dict) -> str:
-    now = _now_vn().strftime("%Y-%m-%d %H:%M:%S (VN)")
-    lines = [ "💵 TRADE GOODS", f"🕰 {now}", "" ]
-    something_actionable = False
+        # 1D (chỉ fetch 7h; còn lại lấy cache)
+        d = load(cache_key(api_sym, DAILY_TF))
+        day_trend = d.get("trend") if d else "N/A"
+        lines.append(f"1D: {day_trend}")
 
-    for name in symbols.keys():
-        m30 = get_cached(st, name, I_30M)
-        h1  = get_cached(st, name, I_1H)
-        h2  = get_cached(st, name, I_2H)
-        h4  = get_cached(st, name, I_4H)
-
-        pair1 = combine_pair(m30, h1, "30min", "1h")
-        pair2 = combine_pair(h2, h4, "2h", "4h")
-
-        d1 = st["daily"]["data"].get(name, "N/A")
-
-        # đánh dấu để quyết định có gửi hay không (ít nhất 1 LONG/SHORT)
-        for v in (m30, h1, h2, h4, d1):
-            if v in ("LONG", "SHORT"):
-                something_actionable = True
-
-        lines += [f"==={name}===",
-                  f"30m–1H: {pair1}",
-                  f"2H–4H: {pair2}",
-                  f"1D: {d1}"]
-
-        plan_line = get_1h_plan_line(st, name)
-        if plan_line:
-            lines.append(plan_line)
-
+        # 1H Entry/SL/TP – chỉ khi trend 1h = LONG/SHORT
+        v1h = load(cache_key(api_sym, "1h"))
+        if v1h and v1h.get("entry") and (load(cache_key(api_sym, "1h")).get("trend") in ("LONG","SHORT") or infer_trend([{"close":v1h["last"],"open":v1h["last"],"high":v1h["last"],"low":v1h["last"]}] ) ):
+            entry = v1h["entry"]; sl = v1h["sl"]; tp = v1h["tp"]
+            lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
         lines.append("")
+    return "\n".join(lines).rstrip()
 
-    msg = "\n".join(lines).rstrip()
-
-    # chỉ gửi khi có ít nhất 1 LONG/SHORT (theo yêu cầu)
-    if not something_actionable:
-        log.info("Only SIDEWAY/N/A signals -> not sending.")
-        return ""
-    return msg
-
-# ============ MAIN LOOP (1 lần chạy) ============
-# ============ MAIN LOOP (1 lần chạy) ============
 def main():
     if not API_KEY:
-        log.error("Missing TWELVE_DATA_KEY")
-    st = load_state()
-
-    # 1D: chỉ fetch 07:00 VN
-    update_daily_if_needed(st)
-
-    # Round-robin: chọn tối đa RPM (<=7) cặp (symbol, interval) để fetch mỗi lần chạy
-    batch = pick_batch(st, RPM)
-    log.info("Batch: %s", batch)
-
-    calls = 0
-    start_min = int(time.time() // 60)
-    for (name, interval) in batch:
-        # tôn trọng giới hạn 8/min: nếu quá, dừng
-        if calls >= RPM:
-            break
-        # fetch cập nhật cache
-        update_interval_cache(st, name, interval)
-        calls += 1
-        # spacing nhẹ để an toàn
-        time.sleep(max(0, 60.0 / RPM / 2))
-
-    save_state(st)
-
-    # Xây tin nhắn & gửi
-    msg = build_message(st)
-    if msg:
-        tg_send(msg)
+        log.error("Missing TwelveData API key")
+    fetch_daily_if_7am()
+    throttled_round_robin()
+    msg = render_message()
+    telegram_send(msg)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.exception("Fatal: %s", e)
+        sys.exit(1)
