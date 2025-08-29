@@ -109,7 +109,7 @@ def td_get(symbol: str, interval: str, count: int = 200):
             })
         except Exception:
             pass
-		return out
+	return out
 
 def sma(closes, n):
     if len(closes) < n: return None
