@@ -1,289 +1,262 @@
-#!/usr/bin/env python3
+# main.py
 # -*- coding: utf-8 -*-
 
-"""
-MAIN (round-robin + daily-at-7am cache)
-- Keeps technical logic (EMA20/50 trend + 1H ATR Entry/SL/TP)
-- Round-robin per minute (slot 0: 30m; slot 1: 1h+2h; slot 2: 4h)
-- Cap API per run: MAX_CALLS_PER_RUN (default 7)
-- Daily (1D) fetch only at 07:00 VN; otherwise use cached 1D per symbol
-ENV:
-  TWELVEDATA_API_KEY (or TD_API_KEY)
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  MAX_CALLS_PER_RUN (default 7)
-  LOG_LEVEL (default INFO)
-"""
-
-import os, json, time, logging, math
+import os, sys, json, time, math, logging, traceback
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional
 import requests
 
-# ========== CONFIG ==========
-VN_TZ = timezone(timedelta(hours=7))
-STATE_FILE = "state_rr.json"
-MAX_CALLS_PER_RUN = int(os.getenv("MAX_CALLS_PER_RUN", "7"))
+# =============== CONFIG ===============
+API_KEY          = os.getenv("TWELVE_DATA_KEY", "")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SYMBOLS: List[str] = [
-    "BTC/USD",
-    "ETH/USD",
-    "CL",
-    "XAU/USD",
-    "USD/JPY",
+BASE_URL = "https://api.twelvedata.com/time_series"
+TZ_NAME  = os.getenv("TZ", "Asia/Ho_Chi_Minh")
+
+RPM = int(os.getenv("RPM", "7"))  # throttle per minute
+
+SYMBOLS = {
+    "Bitcoin":   "BTC/USD",
+    "Ethereum":  "ETH/USD",
+    "XAU/USD (Gold)": "XAU/USD",
+    "WTI Oil":   "CL",
+    "USD/JPY":   "USD/JPY",
+}
+
+GROUP_LABELS = [("30m-1H", ["30min", "1h"]),
+                ("2H-4H",  ["2h", "4h"])]
+
+ALL_INTERVALS = ["30min", "1h", "2h", "4h", "1day"]
+
+ROUND_ROBIN = [
+    ["30min"],
+    ["1h", "2h"],
+    ["4h"],
 ]
-TD_API_KEY = os.getenv("TWELVE_DATA_KEY", "") or os.getenv("TD_API_KEY", "")
-TD_BASE = "https://api.twelvedata.com"
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                    format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("main")
+STATE_PATH = "state.json"
 
-# ========== Utilities ==========
-def now_vn() -> datetime:
-    return datetime.now(VN_TZ)
-
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
+def load_state():
+    if os.path.exists(STATE_PATH):
         try:
-            return json.load(open(STATE_FILE, "r", encoding="utf-8"))
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             return {}
     return {}
 
-def save_state(st: dict) -> None:
-    try:
-        json.dump(st, open(STATE_FILE, "w", encoding="utf-8"))
-    except Exception:
-        pass
+def save_state(st):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False)
+    os.replace(tmp, STATE_PATH)
 
-def td_get(path: str, params: dict) -> dict:
-    if not TD_API_KEY:
-        raise RuntimeError("Missing TWELVEDATA_API_KEY / TD_API_KEY")
-    p = dict(params or {})
-    p["apikey"] = TD_API_KEY
-    url = f"{TD_BASE.rstrip('/')}/{path.lstrip('/')}"
-    r = requests.get(url, params=p, timeout=30)
-    if r.status_code == 429:
-        log.warning("TD 429: wait 65s then retry once...")
-        time.sleep(65)
-        r = requests.get(url, params=p, timeout=30)
-    r.raise_for_status()
-    return r.json()
+STATE = load_state()
 
-# ========== TA logic (kept) ==========
-def ema_last(values: List[float], span: int) -> Optional[float]:
-    if len(values) < span: return None
-    k = 2 / (span + 1)
-    e = values[0]
-    for x in values[1:]:
-        e = x * k + e * (1 - k)
-    return e
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("tradebot")
 
-def classify_trend(closes_desc: List[float]) -> str:
-    """closes_desc: newest->oldest"""
-    if not closes_desc or len(closes_desc) < 60: return "N/A"
-    arr = list(reversed(closes_desc))  # oldest->newest
-    e20_prev = ema_last(arr[:-1], 20); e20 = ema_last(arr, 20); e50 = ema_last(arr, 50)
-    if None in (e20_prev, e20, e50): return "N/A"
-    slope = e20 - e20_prev
-    last = arr[-1]
-    if last > e20 and e20 > e50 and slope > 0: return "LONG"
-    if last < e20 and e20 < e50 and slope < 0: return "SHORT"
+try:
+    import zoneinfo
+    VN_TZ = zoneinfo.ZoneInfo(TZ_NAME)
+except Exception:
+    VN_TZ = timezone(timedelta(hours=7))
+
+def now_vn():
+    return datetime.now(VN_TZ)
+
+def is_candle_close(interval: str, t: datetime) -> bool:
+    m = t.minute; h = t.hour
+    if interval == "30min": return (m % 30) == 0
+    if interval == "1h":    return m == 0
+    if interval == "2h":    return (h % 2 == 0) and (m == 0)
+    if interval == "4h":    return (h % 4 == 0) and (m == 0)
+    return False
+
+def should_fetch_daily(t: datetime) -> bool:
+    return (t.hour == 7 and t.minute == 0)
+
+def td_get(symbol: str, interval: str, count: int = 200):
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": count,
+        "apikey": API_KEY,
+        "format": "JSON",
+        "source": "docs",
+        "dp": 8,
+        "order": "desc",
+        "ext_hours": "false",
+    }
+    res = requests.get(BASE_URL, params=params, timeout=20)
+    if res.status_code != 200:
+        raise RuntimeError(f"TD HTTP {res.status_code}: {res.text[:200]}")
+    data = res.json()
+    if "values" not in data:
+        raise RuntimeError(f"TD error {symbol} {interval}: {data}")
+    out = []
+    for v in data["values"]:
+        try:
+            out.append({
+                "datetime": v["datetime"],
+                "open": float(v["open"]),
+                "high": float(v["high"]),
+                "low":  float(v["low"]),
+                "close":float(v["close"]),
+            })
+        except Exception:
+            pass
+		return out
+
+def sma(closes, n):
+    if len(closes) < n: return None
+    return sum(closes[:n]) / n
+
+def classify_trend(closes):
+    if len(closes) < 25: return "N/A"
+    sma9  = sma(closes, 9)
+    sma21 = sma(closes, 21)
+    if sma9 is None or sma21 is None: return "N/A"
+    if sma9 > sma21 * 1.001: return "LONG"
+    if sma9 < sma21 * 0.999: return "SHORT"
     return "SIDEWAY"
 
-def fetch_trend(symbol: str, interval: str, outputsize: int = 200) -> str:
-    try:
-        j = td_get("/time_series", {
-            "symbol": symbol, "interval": interval, "outputsize": outputsize, "order": "DESC"
-        })
-        vals = j.get("values", [])
-        closes = [float(v["close"]) for v in vals]
-        return classify_trend(closes)
-    except Exception as e:
-        log.warning("Fetch fail %s %s: %s", symbol, interval, e)
-        return "N/A"
+def atr14(ohlc):
+    if len(ohlc) < 15: return None
+    trs = []
+    prev_close = ohlc[1]["close"]
+    for i in range(0, 15):
+        h = ohlc[i]["high"]; l = ohlc[i]["low"]
+        c_prev = ohlc[i+1]["close"] if i+1 < len(ohlc) else prev_close
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        trs.append(tr)
+    return sum(trs) / len(trs)
 
-def atr14_from_series(vals_desc: List[dict]) -> Optional[float]:
-    """Compute ATR14 from newest->oldest values list."""
-    try:
-        # convert to oldest->newest
-        vals = list(reversed(vals_desc))
-        highs = [float(v["high"]) for v in vals]
-        lows  = [float(v["low"])  for v in vals]
-        closes= [float(v["close"]) for v in vals]
-        if len(closes) < 15: return None
-        trs = []
-        prev = closes[0]
-        for i in range(1, len(closes)):
-            tr = max(highs[i] - lows[i], abs(highs[i] - prev), abs(lows[i] - prev))
-            trs.append(tr); prev = closes[i]
-        if len(trs) < 14: return None
-        atr = sum(trs[:14])/14.0
-        for tr in trs[14:]:
-            atr = (atr*13 + tr)/14.0
-        return atr
-    except Exception:
-        return None
+def cache_get(sym: str, interval: str):
+    return STATE.get(f"{sym}:{interval}")
 
-def one_hour_plan(symbol: str):
-    """Return (direction, entry, sl, tp, atr) using 1h series; keep previous logic style."""
-    try:
-        j = td_get("/time_series", {"symbol": symbol, "interval": "1h", "outputsize": 200, "order": "DESC"})
-        vals = j.get("values", [])
-        if len(vals) < 60: return "N/A", None
-        closes = [float(v["close"]) for v in vals]
-        direction = classify_trend(closes)
-        if direction in ("N/A", "SIDEWAY"): return direction, None
-        a = atr14_from_series(vals)
-        if a is None: return direction, None
-        entry = closes[0]
-        sl_mult = float(os.getenv("SL_ATR_MULT", "1.5"))
-        tp_mult = float(os.getenv("TP_ATR_MULT", "2.5"))
-        if direction == "LONG":
-            sl = entry - sl_mult*a; tp = entry + tp_mult*a
-        else:
-            sl = entry + sl_mult*a; tp = entry - tp_mult*a
-        return direction, {"entry": entry, "sl": sl, "tp": tp, "atr": a}
-    except Exception as e:
-        log.warning("1H plan fail %s: %s", symbol, e)
-        return "N/A", None
+def cache_put(sym: str, interval: str, trend: str, entry=None, sl=None, tp=None, asof=None):
+    key = f"{sym}:{interval}"
+    STATE[key] = {
+        "trend": trend,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "asof": asof or now_vn().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
-# ========== Telegram ==========
 def telegram_send(text: str):
-    if not BOT_TOKEN or not CHAT_ID:
-        log.warning("Telegram missing config")
-        return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram env missing, skip send"); return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text,
+               "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=30)
-        r.raise_for_status()
-        log.info("Telegram sent")
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            log.warning("Telegram send fail: %s", r.text[:200])
     except Exception as e:
         log.warning("Telegram error: %s", e)
 
-# ========== Round-robin scheduler ==========
-SLOT_TFS = {0: ["30min"], 1: ["1h","2h"], 2: ["4h"]}
+def fmt_num(x):
+    if x is None: return "N/A"
+    if isinstance(x, (int,)) or abs(x) >= 1000:
+        return f"{x:,.2f}"
+    return f"{x:.4f}"
 
-def get_slot(now=None) -> int:
-    now = now or now_vn()
-    return now.minute % 3
-
-def need_refresh_daily(now=None) -> bool:
-    now = now or now_vn()
-    return now.hour == 7 and now.minute == 0
+def build_message(results, plan1h):
+    t = now_vn().strftime("%Y-%m-%d %H:%M:%S (VN)")
+    lines = []
+    lines.append("💵 TRADE GOODS")
+    lines.append(f"🕰 {t}")
+    lines.append("")
+    for name in SYMBOLS.keys():
+        sym = SYMBOLS[name]
+        rs  = results.get(sym, {})
+        lines.append(f"==={name}===")
+        g1 = ["30min","1h"]
+        if rs.get("30min") == rs.get("1h"):
+            lines.append(f"30m-1H: {rs.get('30min','N/A')}")
+        else:
+            lines.append(f"30m-1H: Mixed ({rs.get('30min','N/A')},{rs.get('1h','N/A')})")
+        g2 = ["2h","4h"]
+        if rs.get("2h") == rs.get("4h"):
+            lines.append(f"2H-4H: {rs.get('2h','N/A')}")
+        else:
+            lines.append(f"2H-4H: Mixed ({rs.get('2h','N/A')},{rs.get('4h','N/A')})")
+        lines.append(f"1D: {rs.get('1day','N/A')}")
+        p1 = plan1h.get(sym)
+        if p1 and (p1.get("entry") is not None):
+            lines.append(f"Entry {fmt_num(p1['entry'])} | SL {fmt_num(p1['sl'])} | TP {fmt_num(p1['tp'])}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 def run_once():
-    st = load_state()
-    now = now_vn()
-    slot = get_slot(now)
-    tfs = SLOT_TFS[slot]
+    t = now_vn()
+		minute_slot = t.minute % len(ROUND_ROBIN)
+    planned_intervals = set(ROUND_ROBIN[minute_slot])
+    if should_fetch_daily(t):
+        planned_intervals.add("1day")
 
-    # Daily 1D
-    if need_refresh_daily(now):
-        for sym in SYMBOLS:
-            trend1d = fetch_trend(sym, "1day", 200)
-            st[f"{sym}::1d"] = {"trend": trend1d, "ts": now.isoformat()}
-            time.sleep(0.2)
-        save_state(st)
-        daily_refreshed = True
-    else:
-        daily_refreshed = False
-    daily_cache = {s: st.get(f"{s}::1d", {}).get("trend", "N/A") for s in SYMBOLS}
+    results = {}; plan1h = {}; calls = 0
 
-    # Round-robin symbol window to cap calls/run
-    rr_key = f"rr_slot_{slot}"
-    start_idx = int(st.get(rr_key, 0)) % max(1, len(SYMBOLS))
-    calls_per_sym = len(tfs)
-    max_syms = max(1, MAX_CALLS_PER_RUN // calls_per_sym)
-    order = SYMBOLS[start_idx:] + SYMBOLS[:start_idx]
-    pick = order[:max_syms]
+    for name, sym in SYMBOLS.items():
+        results[sym] = {}
+        for iv in ALL_INTERVALS:
+            try:
+                can_fetch = (iv in planned_intervals and
+                             (iv == "1day" and should_fetch_daily(t) or iv != "1day") and
+                             (iv == "1day" or is_candle_close(iv, t)))
+                if can_fetch and calls < RPM:
+                    ohlc = td_get(sym, iv, count=200)
+                    calls += 1
+                    closes = [bar["close"] for bar in ohlc]
+                    trend = classify_trend(closes)
+                    results[sym][iv] = trend
+                    cache_put(sym, iv, trend)
+                    if iv == "1h":
+                        atr = atr14(ohlc); last = ohlc[0]["close"]
+                        if atr and last:
+                            if trend == "LONG":
+                                entry, sl, tp = last, last-atr, last+atr
+                            elif trend == "SHORT":
+                                entry, sl, tp = last, last+atr, last-atr
+                            else:
+                                entry=sl=tp=last
+                            cache_put(sym, "1h_plan", trend, entry, sl, tp)
+                if not results[sym].get(iv):
+                    c = cache_get(sym, iv)
+                    results[sym][iv] = c["trend"] if c else "N/A"
+                if iv == "1h" and sym not in plan1h:
+                    pc = cache_get(sym, "1h_plan")
+                    if pc:
+                        plan1h[sym] = {"entry": pc.get("entry"),"sl": pc.get("sl"),"tp": pc.get("tp")}
+            except Exception as e:
+                log.warning("Fetch fail %s %s: %s", sym, iv, e)
+                c = cache_get(sym, iv)
+                results[sym][iv] = c["trend"] if c else "N/A"
+                if iv == "1h" and sym not in plan1h:
+                    pc = cache_get(sym, "1h_plan")
+                    if pc:
+                        plan1h[sym] = {"entry": pc.get("entry"),"sl": pc.get("sl"),"tp": pc.get("tp")}
+        if sym not in plan1h:
+            plan1h[sym] = {"entry": None,"sl": None,"tp": None}
 
-    log.info("Slot=%s TFs=%s start=%s pick=%s", slot, tfs, start_idx, ",".join(pick))
-
-    # Collect result
-    res: Dict[str, Dict[str, str]] = {s: {"30min":"...", "1h":"...", "2h":"...", "4h":"...", "1day": daily_cache.get(s,"N/A")} for s in SYMBOLS}
-
-    # Fetch for picked symbols
-    for s in pick:
-        for tf in tfs:
-            res[s][tf] = fetch_trend(s, tf, 200)
-            time.sleep(0.2)
-
-    # 1H plan (Entry/SL/TP) — optional: compute only when slot contains 1h to save calls
-    plans: Dict[str, str] = {}
-    if "1h" in tfs:
-        for s in pick:
-            dir1h, plan = one_hour_plan(s)
-            if plan and dir1h in ("LONG","SHORT"):
-                plans[s] = f"Entry {plan['entry']:.2f} | SL {plan['sl']:.2f} | TP {plan['tp']:.2f}"
-            else:
-                plans[s] = ""
-    else:
-        # reuse last plan from state if exists (optional)
-        for s in SYMBOLS:
-            plans[s] = st.get(f"{s}::plan1h", "")
-
-    # persist rr index and latest plans
-    st[rr_key] = (start_idx + len(pick)) % max(1, len(SYMBOLS))
-    for s, text in plans.items():
-        if text:
-            st[f"{s}::plan1h"] = text
-    save_state(st)
-
-    # ----- build Telegram message block (giữ nguyên header, chỉ thay phần thân) -----
-    lines = [ "💵 TRADE GOODS", f"🕒 {now_vn} (VN)", "" ]
-    
-    for s in SYMBOLS:
-        r = res[s]  # r có keys: '30min','1h','2h','4h','1day'
-        lines.append(f"==={s}===")
-    
-        # gộp 30m-1H
-        a, b = r.get("30min", "N/A"), r.get("1h", "N/A")
-        if a == b:
-            lines.append(f"30m-1H: {a}")
-        else:
-            lines.append(f"30m-1H: Mixed (30min:{a}, 1h:{b})")
-    
-        # gộp 2H-4H
-        a, b = r.get("2h", "N/A"), r.get("4h", "N/A")
-        if a == b:
-            lines.append(f"2H-4H: {a}")
-        else:
-            lines.append(f"2H-4H: Mixed (2h:{a}, 4h:{b})")
-    
-        # 1D (dùng cache nếu bạn đã set)
-        lines.append(f"1D: {r.get('1day', 'N/A')}")
-    
-        # dòng Entry | SL | TP (rút gọn từ plan1h)
-        p = st.get(f"{s}::plan1h")
-        if p:
-            if "Entry" in p and "SL" in p and "TP" in p:
-                # lấy đúng 3 phần và in ngắn
-                parts = [x.strip() for x in p.split("|")]
-                entry = next((x for x in parts if x.strip().startswith("Entry")), None)
-                sl    = next((x for x in parts if x.strip().startswith("SL")), None)
-                tp    = next((x for x in parts if x.strip().startswith("TP")), None)
-                if entry and sl and tp:
-                    lines.append(f"{entry} | {sl} | {tp}")
-                else:
-                    lines.append(p)  # fallback nếu cấu trúc lạ
-        lines.append("")  # ngắt dòng giữa các symbol
-    
-    msg = "\n".join(lines).rstrip()
+    save_state(STATE)
+    msg = build_message(results, plan1h)
     telegram_send(msg)
 
 def main():
     try:
         run_once()
     except Exception as e:
-        log.exception("Fatal: %s", e)
-        try:
-            telegram_send(f"💵 TRADE GOODS\n❌ ERROR: {e}")
-        except Exception:
-            pass
-        raise
+        log.error("Fatal: %s", e)
+        try: telegram_send(f"⚠️ Bot error: {e}")
+        except: pass
 
 if __name__ == "__main__":
     main()
+          
