@@ -218,7 +218,7 @@ def rr_next_batch(limit: int) -> List[Tuple[str,str]]:
     out = []
     for i in range(limit):
         out.append(all_pairs[(idx+i) % len(all_pairs)])
-    store(rr_index_key(), (idx+limit) % len(all_pairs), ex=24*3600)
+    store(rr_index_key(), (idx+limit) % len(all_pairs), ttl=24*3600)
     return out
 
 # ============== FETCH/STORE HELPERS ==============
