@@ -27,7 +27,7 @@ MAX_CALLS_PER_RUN = int(os.getenv("MAX_CALLS_PER_RUN", "7"))
 SYMBOLS: List[str] = [
     "BTC/USD",
     "ETH/USD",
-    "WTI Oil": "CL",
+    "CL",
     "XAU/USD",
     "USD/JPY",
 ]
