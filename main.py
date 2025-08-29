@@ -278,17 +278,25 @@ def fetch_daily_if_7am():
             get_or_fetch(api_sym, DAILY_TF, ttl=26*3600)
 
 def throttled_round_robin():
-    # mỗi lần chạy chỉ gọi tối đa (RPM) cái; trừ hao 1–2 cho fallback
+    # gọi tối đa RPM-1/lần chạy để chừa headroom cho lỗi/lặp khác
     budget = max(1, RPM - 1)
     batch = rr_next_batch(budget)
     log.info("Batch: %s", batch)
+
+    # khoảng nghỉ giữa 2 call (giây)
+    gap = max(9, int(60 / max(1, RPM)))   # ví dụ RPM=7 => ~8-9s, mình để 9s an toàn
+
     used = 0
-    for disp, tf in batch:
+    for i, (disp, tf) in enumerate(batch):
         api_sym = api_symbol(disp)
-        # chỉ fetch khi nến "gần đóng" để giảm noise
-        # (nhưng vẫn cache nếu chưa có)
+
+        # chỉ fetch khi nến "gần đóng" + vẫn dùng cache nếu có
         get_or_fetch(api_sym, tf, ttl=3600)
         used += 1
+
+        # chỉ sleep nếu còn phần tử phía sau
+        if i < len(batch) - 1:
+            time.sleep(gap)
     return used
 
 def render_message() -> str:
