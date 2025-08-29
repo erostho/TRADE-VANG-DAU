@@ -14,12 +14,12 @@ BASE_URL = "https://api.twelvedata.com/time_series"
 FETCH_LIVE = True
 
 # Symbols (hiển thị -> mã TwelveData)
-SYMBOLS: Dict[str, str] = {
-    "Bitcoin":   "BTC/USD",
-    "Ethereum":  "ETH/USD",
-    "XAU/USD (Gold)": "XAU/USD",
-    "WTI Oil":   "CL",          # WTI futures (free plan có thể hạn chế theo interval)
-    "USD/JPY":   "USD/JPY",
+SYMBOLS = {
+    "Bitcoin": "BTC/USD",
+    "Ethereum": "ETH/USD",
+    "Gold": "XAU/USD",
+    "WTI Oil": "CL",
+    "USD/JPY": "USD/JPY",
 }
 
 # Các khung cần theo dõi
