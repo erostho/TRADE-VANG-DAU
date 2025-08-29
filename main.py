@@ -196,7 +196,7 @@ def build_message(results, plan1h):
 
 def run_once():
     t = now_vn()
-		minute_slot = t.minute % len(ROUND_ROBIN)
+    minute_slot = t.minute % len(ROUND_ROBIN)
     planned_intervals = set(ROUND_ROBIN[minute_slot])
     if should_fetch_daily(t):
         planned_intervals.add("1day")
