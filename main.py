@@ -24,13 +24,13 @@ VN_TZ = timezone(timedelta(hours=7))
 STATE_FILE = "state_rr.json"
 MAX_CALLS_PER_RUN = int(os.getenv("MAX_CALLS_PER_RUN", "7"))
 
-SYMBOLS: List[str] = [
-    "BTC/USD",
-    "ETH/USD",
-    "CL",
-    "XAU/USD",
-    "USD/JPY",
-]
+symbols = {
+    "Bitcoin": "BTC/USD",
+    "Ethereum": "ETH/USD",
+    "XAU/USD (Gold)": "XAU/USD",
+    "WTI Oil": "CL",
+    "USD/JPY": "USD/JPY",
+}
 
 TD_API_KEY = os.getenv("TWELVE_DATA_KEY", "") or os.getenv("TD_API_KEY", "")
 TD_BASE = "https://api.twelvedata.com"
@@ -235,7 +235,6 @@ def run_once():
 
     # Build message
     lines = ["💵 TRADE GOODS", f"⏱ {now.strftime('%Y-%m-%d %H:%M:%S')} (VN)"]
-    lines.append(f"Slot {slot} | TFs: {', '.join(tfs)} | Max calls/run: {MAX_CALLS_PER_RUN}")
     if daily_refreshed: lines.append("Daily 1D: refreshed ✅")
     lines.append("")
 
