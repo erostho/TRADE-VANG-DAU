@@ -232,25 +232,46 @@ def run_once():
             st[f"{s}::plan1h"] = text
     save_state(st)
 
-    # Build message
-    lines = ["💵 TRADE GOODS", f"⏱ {now.strftime('%Y-%m-%d %H:%M:%S')} (VN)"]
-    if daily_refreshed: lines.append("Daily 1D: refreshed ✅")
-    lines.append("")
-
+    # ----- build Telegram message block (giữ nguyên header, chỉ thay phần thân) -----
+    lines = [ "💵 TRADE GOODS", f"🕒 {now_vn} (VN)", "" ]
+    
     for s in SYMBOLS:
-        r = res[s]
+        r = res[s]  # r có keys: '30min','1h','2h','4h','1day'
         lines.append(f"==={s}===")
-        lines.append(f"30m: {r['30min']}")
-        lines.append(f"1h:  {r['1h']}")
-        lines.append(f"2h:  {r['2h']}")
-        lines.append(f"4h:  {r['4h']}")
-        lines.append(f"1d:  {r['1day']}")
-        if st.get(f"{s}::plan1h"):
-            lines.append(st[f"{s}::plan1h"])
-        lines.append("")
-
+    
+        # gộp 30m-1H
+        a, b = r.get("30min", "N/A"), r.get("1h", "N/A")
+        if a == b:
+            lines.append(f"30m-1H: {a}")
+        else:
+            lines.append(f"30m-1H: Mixed (30min:{a}, 1h:{b})")
+    
+        # gộp 2H-4H
+        a, b = r.get("2h", "N/A"), r.get("4h", "N/A")
+        if a == b:
+            lines.append(f"2H-4H: {a}")
+        else:
+            lines.append(f"2H-4H: Mixed (2h:{a}, 4h:{b})")
+    
+        # 1D (dùng cache nếu bạn đã set)
+        lines.append(f"1D: {r.get('1day', 'N/A')}")
+    
+        # dòng Entry | SL | TP (rút gọn từ plan1h)
+        p = st.get(f"{s}::plan1h")
+        if p:
+            if "Entry" in p and "SL" in p and "TP" in p:
+                # lấy đúng 3 phần và in ngắn
+                parts = [x.strip() for x in p.split("|")]
+                entry = next((x for x in parts if x.strip().startswith("Entry")), None)
+                sl    = next((x for x in parts if x.strip().startswith("SL")), None)
+                tp    = next((x for x in parts if x.strip().startswith("TP")), None)
+                if entry and sl and tp:
+                    lines.append(f"{entry} | {sl} | {tp}")
+                else:
+                    lines.append(p)  # fallback nếu cấu trúc lạ
+        lines.append("")  # ngắt dòng giữa các symbol
+    
     msg = "\n".join(lines).rstrip()
-    log.info("Message:\n%s", msg)
     telegram_send(msg)
 
 def main():
