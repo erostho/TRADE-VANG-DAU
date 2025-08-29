@@ -14,10 +14,10 @@ BASE_URL = "https://api.twelvedata.com/time_series"
 FETCH_LIVE = True
 
 # Symbols (hiển thị -> mã TwelveData)
-SYMBOLS = {
+symbols = {
     "Bitcoin": "BTC/USD",
     "Ethereum": "ETH/USD",
-    "Gold": "XAU/USD",
+    "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
     "USD/JPY": "USD/JPY",
 }
@@ -50,7 +50,7 @@ def load_state() -> dict:
             pass
     # default state
     rr = []  # hàng đợi round-robin
-    for name in SYMBOLS.keys():
+    for name in symbols.keys():
         rr += [(name, I_30M), (name, I_1H), (name, I_2H), (name, I_4H)]
     return {
         "rr": rr,              # hàng đợi còn lại lần chạy hiện tại
@@ -145,7 +145,7 @@ def detect_trend(values_desc: List[dict]) -> str:
 # ============ Round-robin pick ============
 def build_rr_list() -> List[Tuple[str, str]]:
     rr = []
-    for name in SYMBOLS.keys():
+    for name in symbols.keys():
         rr += [(name, I_30M), (name, I_1H), (name, I_2H), (name, I_4H)]
     return rr
 
@@ -166,7 +166,7 @@ def pick_batch(st: dict, limit: int) -> List[Tuple[str, str]]:
 
 # ============ Business rules ============
 def update_interval_cache(st: dict, disp_name: str, interval: str):
-    code = SYMBOLS[disp_name]
+    code = symbols[disp_name]
     try:
         values, last_bar = fetch_series(code, interval)
         trend = detect_trend(values)
@@ -211,7 +211,7 @@ def update_daily_if_needed(st: dict):
     if not is_7am_window:
         return
     data = {}
-    for name, code in SYMBOLS.items():
+    for name, code in symbols.items():
         try:
             vals, _ = fetch_series(code, I_1D)
             data[name] = detect_trend(vals)
@@ -266,7 +266,7 @@ def build_message(st: dict) -> str:
     lines = [ "💵 TRADE GOODS", f"🕰 {now}", "" ]
     something_actionable = False
 
-    for name in SYMBOLS.keys():
+    for name in symbols.keys():
         m30 = get_cached(st, name, I_30M)
         h1  = get_cached(st, name, I_1H)
         h2  = get_cached(st, name, I_2H)
