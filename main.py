@@ -20,11 +20,12 @@ SYMBOLS: List[str] = [
     "BTC/USD",
     "ETH/USD",
     "XAU/USD",
+    "WTI Oil": "CL",
     "USD/JPY",
 ]
 
 # TwelveData
-TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "") or os.getenv("TD_API_KEY", "")
+TD_API_KEY = os.getenv("TWELVE_DATA_KEY", "") or os.getenv("TD_API_KEY", "")
 TD_BASE = "https://api.twelvedata.com"
 
 # Telegram
@@ -184,7 +185,6 @@ def run_once():
 
     header = ["💵 TRADE GOODS", f"⏱ {now.strftime('%Y-%m-%d %H:%M:%S')} (VN)"]
     lines: List[str] = header
-    lines.append(f"Slot {slot} | TFs: {', '.join(tfs)} | Max calls this run: {MAX_CALLS_PER_RUN}")
     if daily_refetched:
         lines.append("Daily 1D: refreshed ✅")
     lines.append("")
