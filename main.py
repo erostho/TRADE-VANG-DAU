@@ -29,8 +29,8 @@ symbols = {
     "Bitcoin": "BTC/USD",
     "Ethereum": "ETH/USD",
     "XAU/USD (Gold)": "XAU/USD",
-    "USTEC": "NDX",
-    "US30": "DJI",
+    "WTI Oil": "CL",
+    "USD/JPY": "USD/JPY",
 }
 
 interval_groups = {
