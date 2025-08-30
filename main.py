@@ -1,4 +1,3 @@
-
 import os
 import time
 import logging
@@ -87,12 +86,16 @@ def get_trend(df):
 
 def analyze_symbol(name, symbol):
     results = {}
+    has_data = False  # <--- thêm cờ có dữ liệu
+
     for group, intervals in interval_groups.items():
         trends = []
         for iv in intervals:
             df = fetch_candles(symbol, iv)
             trend = get_trend(df)
             trends.append(f"{iv}:{trend}")
+            if trend != "N/A":
+                has_data = True  # <--- nếu có bất kỳ khung nào có dữ liệu
             time.sleep(60.0/RPM)
         # Nếu 1 interval -> trực tiếp
         if len(intervals) == 1:
@@ -103,12 +106,15 @@ def analyze_symbol(name, symbol):
                 results[group] = uniq.pop()
             else:
                 results[group] = "Mixed (" + ", ".join(trends) + ")"
+
     # Entry/SL/TP từ 1H
     df1h = fetch_candles(symbol, "1h")
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
     if df1h is not None and len(df1h) > 20:
         bias = get_trend(df1h)
+        if bias != "N/A":
+            has_data = True  # <--- 1H cũng là dữ liệu hợp lệ
         entry = df1h["close"].iloc[-1]
         atrval = atr(df1h, 14)
         if bias == "LONG":
@@ -119,7 +125,8 @@ def analyze_symbol(name, symbol):
             plan = "SHORT"
             sl = entry + 1.5*atrval
             tp = entry - 1.5*atrval
-    return results, plan, entry, sl, tp, atrval
+
+    return results, plan, entry, sl, tp, atrval, has_data  # <--- trả thêm cờ
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -139,14 +146,26 @@ def main():
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     lines.append("💵 TRADE GOODS")
     lines.append(f"⏱ {now}\n")
+
+    any_symbol_has_data = False  # <--- tổng hợp cờ
+
     for name, sym in symbols.items():
-        results, plan, entry, sl, tp, atrval = analyze_symbol(name, sym)
+        results, plan, entry, sl, tp, atrval, has_data = analyze_symbol(name, sym)
+        if has_data:
+            any_symbol_has_data = True
+
         lines.append(f"==={name}===")
         for group, trend in results.items():
             lines.append(f"{group}: {trend}")
         if entry and sl and tp:
             lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
         lines.append("")
+
+    # Nếu TẤT CẢ đều N/A -> KHÔNG gửi
+    if not any_symbol_has_data:
+        logging.info("Skip Telegram: all symbols/timeframes are N/A")
+        return
+
     msg = "\n".join(lines)
     send_telegram(msg)
 
