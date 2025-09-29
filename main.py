@@ -84,59 +84,36 @@ def get_trend(df):
         return "SHORT"
     else:
         return "SIDEWAY"
-def _iv_minutes(iv: str) -> int:
-    """Quy đổi chu kỳ về phút."""
-    return 15 if iv in ("15min", "15m") else 30 if iv in ("30min", "30m") else 60
 
-def recent_trend(symbol: str, interval: str, window_minutes: int = 60, threshold: float = 0.001) -> str:
-    """
-    Trend trong ~1 giờ qua của 1 khung (15m/30m).
-    - Lấy các nến có thời gian >= now-60m (fallback: lấy 4 nến 15m hoặc 2 nến 30m).
-    - Định hướng theo % thay đổi từ open đầu → close cuối:
-        + |pct| < threshold (mặc định 0.1%) => SIDEWAY
-        + pct > 0 => LONG ; pct < 0 => SHORT
-      Nếu sát ngưỡng, dùng đa số (số nến xanh/đỏ) để phân xử.
-    """
-    df = fetch_candles(symbol, interval)
-    if df is None or df.empty:
-        return "N/A"
 
-    # lọc ~1h gần nhất
-    cutoff = df["datetime"].max() - pd.Timedelta(minutes=window_minutes)
-    sdf = df[df["datetime"] >= cutoff].copy()
+def recent_1h_trend_15_30(symbol):
+    """Lấy xu hướng 1 giờ qua từ nến 15m và 30m"""
+    def bias(df, need):
+        if df is None or len(df) < need:
+            return "N/A"
+        start = df["close"].iloc[-need]
+        end = df["close"].iloc[-1]
+        if end > start:
+            return "LONG"
+        elif end < start:
+            return "SHORT"
+        return "SIDEWAY"
 
-    # fallback: nếu lọc xong quá ít nến, lấy tối thiểu 4 nến 15m hoặc 2 nến 30m
-    need = 4 if _iv_minutes(interval) == 15 else 2
-    if len(sdf) < need:
-        sdf = df.tail(need).copy()
+    df15 = fetch_candles(symbol, "15min")
+    b15 = bias(df15, 4)
+    time.sleep(60.0/RPM)
 
-    if len(sdf) < 2:
-        return "N/A"
+    df30 = fetch_candles(symbol, "30min")
+    b30 = bias(df30, 2)
 
-    first_open = float(sdf["open"].iloc[0])
-    last_close = float(sdf["close"].iloc[-1])
-    pct = (last_close - first_open) / first_open
-
-    if abs(pct) < threshold:
-        ups = int((sdf["close"] > sdf["open"]).sum())
-        downs = int((sdf["close"] < sdf["open"]).sum())
-        if abs(ups - downs) <= 1:
-            return "SIDEWAY"
-        return "LONG" if ups > downs else "SHORT"
-
-    return "LONG" if pct > 0 else "SHORT"
-
-def recent_1h_trend_15_30(symbol: str) -> str:
-    """Gom 15m & 30m cho 1 giờ qua."""
-    t15 = recent_trend(symbol, "15min")
-    t30 = recent_trend(symbol, "30min")
-    if t15 == t30 and t15 != "N/A":
-        return t15
-    if t15 != "N/A" and t30 == "N/A":
-        return t15
-    if t30 != "N/A" and t15 == "N/A":
-        return t30
-    return f"Mixed (15m:{t15}, 30m:{t30})"
+    uniq = {b15, b30} - {"N/A"}
+    if not uniq:
+        summary = "N/A"
+    elif len(uniq) == 1:
+        summary = uniq.pop()
+    else:
+        summary = "Mixed"
+    return f"{summary} (15m:{b15}, 30m:{b30})"
 
 def analyze_symbol(name, symbol):
     results = {}
