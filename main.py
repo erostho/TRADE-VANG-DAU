@@ -4,7 +4,7 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -14,19 +14,21 @@ logging.basicConfig(
 )
 
 # ================= CONFIG =================
-API_KEY = os.getenv("TWELVE_DATA_KEY", "")
+API_KEY_TD = os.getenv("TWELVE_DATA_KEY", "")
+API_KEY_AV = os.getenv("ALPHA_VANTAGE_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BASE_URL = "https://api.twelvedata.com/time_series"
+BASE_URL_TD = "https://api.twelvedata.com/time_series"
+BASE_URL_YF = "https://query1.finance.yahoo.com/v8/finance/chart"
 TIMEZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")
 
-# Request per minute throttle
 RPM = int(os.getenv("RPM", 7))
 
+# ================= SYMBOLS =================
 symbols = {
     "Bitcoin": "BTC/USD",
-    "XAG/USD (Silver)": "XAG/USD",
+    "Silver (XAG)": "XAG/USD",    # ✅ thay ETH thành BẠC
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
     "USD/JPY": "USD/JPY",
@@ -39,29 +41,76 @@ interval_groups = {
 }
 
 # ================= HELPERS =================
-def fetch_candles(symbol, interval, retries=3):
-    url = f"{BASE_URL}?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize=100"
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 429:
-                logging.warning(f"Rate limit hit for {symbol}-{interval}, sleeping 65s then retry...")
-                time.sleep(65)
-                continue
-            data = r.json()
-            if "values" not in data:
-                logging.warning(f"No data for {symbol}-{interval}: {data}")
-                return None
-            df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.sort_values("datetime").reset_index(drop=True)
-            for col in ["open", "high", "low", "close"]:
-                df[col] = pd.to_numeric(df[col])
-            return df
-        except Exception as e:
-            logging.error(f"Fetch error {symbol}-{interval}: {e}")
-            time.sleep(3)
-    return None
+def fetch_from_twelvedata(symbol, interval):
+    url = f"{BASE_URL_TD}?symbol={symbol}&interval={interval}&apikey={API_KEY_TD}&outputsize=100"
+    r = requests.get(url, timeout=10)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    if "values" not in data:
+        return None
+    df = pd.DataFrame(data["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df = df.sort_values("datetime").reset_index(drop=True)
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col])
+    return df
+
+def fetch_from_yahoo(symbol, interval):
+    mapping = {"15min":"15m","30min":"30m","1h":"60m","2h":"120m","4h":"240m"}
+    if interval not in mapping:
+        return None
+    ticker = symbol.replace("/USD","USD=X").replace("/","-")
+    url = f"{BASE_URL_YF}/{ticker}?interval={mapping[interval]}&range=5d"
+    r = requests.get(url, timeout=10)
+    if r.status_code != 200:
+        return None
+    data = r.json().get("chart", {}).get("result")
+    if not data:
+        return None
+    ts = data[0]["timestamp"]
+    quotes = data[0]["indicators"]["quote"][0]
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(ts, unit="s"),
+        "open": quotes["open"],
+        "high": quotes["high"],
+        "low": quotes["low"],
+        "close": quotes["close"]
+    })
+    return df.dropna()
+
+def fetch_from_alphavantage(symbol, interval):
+    if not API_KEY_AV:
+        return None
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_INTRADAY&symbol={symbol}&interval=60min&apikey={API_KEY_AV}"
+    r = requests.get(url, timeout=10)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    key = list(data.keys())[-1]
+    values = data[key]
+    rows = []
+    for t,v in values.items():
+        rows.append({
+            "datetime": pd.to_datetime(t),
+            "open": float(v["1. open"]),
+            "high": float(v["2. high"]),
+            "low": float(v["3. low"]),
+            "close": float(v["4. close"])
+        })
+    return pd.DataFrame(rows).sort_values("datetime").reset_index(drop=True)
+
+def fetch_candles(symbol, interval):
+    df = fetch_from_twelvedata(symbol, interval)
+    if df is not None and len(df) > 0:
+        return df
+    logging.warning(f"TwelveData NA for {symbol}-{interval}, trying Yahoo")
+    df = fetch_from_yahoo(symbol, interval)
+    if df is not None and len(df) > 0:
+        return df
+    logging.warning(f"Yahoo NA for {symbol}-{interval}, trying AlphaVantage")
+    df = fetch_from_alphavantage(symbol, interval)
+    return df
 
 def atr(df, period=14):
     high = df["high"].values
@@ -86,8 +135,7 @@ def get_trend(df):
 
 def analyze_symbol(name, symbol):
     results = {}
-    has_data = False  # <--- thêm cờ có dữ liệu
-
+    has_data = False
     for group, intervals in interval_groups.items():
         trends = []
         for iv in intervals:
@@ -95,9 +143,8 @@ def analyze_symbol(name, symbol):
             trend = get_trend(df)
             trends.append(f"{iv}:{trend}")
             if trend != "N/A":
-                has_data = True  # <--- nếu có bất kỳ khung nào có dữ liệu
+                has_data = True
             time.sleep(60.0/RPM)
-        # Nếu 1 interval -> trực tiếp
         if len(intervals) == 1:
             results[group] = trends[0].split(":")[1]
         else:
@@ -106,15 +153,13 @@ def analyze_symbol(name, symbol):
                 results[group] = uniq.pop()
             else:
                 results[group] = "Mixed (" + ", ".join(trends) + ")"
-
-    # Entry/SL/TP từ 1H
     df1h = fetch_candles(symbol, "1h")
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
     if df1h is not None and len(df1h) > 20:
         bias = get_trend(df1h)
         if bias != "N/A":
-            has_data = True  # <--- 1H cũng là dữ liệu hợp lệ
+            has_data = True
         entry = df1h["close"].iloc[-1]
         atrval = atr(df1h, 14)
         if bias == "LONG":
@@ -125,8 +170,7 @@ def analyze_symbol(name, symbol):
             plan = "SHORT"
             sl = entry + 1.5*atrval
             tp = entry - 1.5*atrval
-
-    return results, plan, entry, sl, tp, atrval, has_data  # <--- trả thêm cờ
+    return results, plan, entry, sl, tp, atrval, has_data
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -147,25 +191,20 @@ def main():
     lines.append("💵 TRADE GOODS")
     lines.append(f"⏱ {now}\n")
 
-    any_symbol_has_data = False  # <--- tổng hợp cờ
-
+    any_symbol_has_data = False
     for name, sym in symbols.items():
         results, plan, entry, sl, tp, atrval, has_data = analyze_symbol(name, sym)
         if has_data:
             any_symbol_has_data = True
-
         lines.append(f"==={name}===")
         for group, trend in results.items():
             lines.append(f"{group}: {trend}")
         if entry and sl and tp:
             lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
         lines.append("")
-
-    # Nếu TẤT CẢ đều N/A -> KHÔNG gửi
     if not any_symbol_has_data:
         logging.info("Skip Telegram: all symbols/timeframes are N/A")
         return
-
     msg = "\n".join(lines)
     send_telegram(msg)
 
