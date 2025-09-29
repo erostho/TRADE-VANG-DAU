@@ -201,7 +201,6 @@ def main():
         lines.append(f"==={name}===")
         for group, trend in results.items():
             lines.append(f"{group}: {trend}")
-        # <= THÊM DÒNG NÀY
         lines.append(f"15m-30m (1h qua): {recent_1h_trend_15_30(sym)}")
         if entry and sl and tp:
             lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
