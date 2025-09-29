@@ -83,60 +83,89 @@ def fetch_candles_td(symbol, interval, retries=3):
 
 # ---------- Yahoo Finance (dành cho Bạc) ----------
 # Map interval của mình -> Yahoo interval và range tối thiểu
+# --- Yahoo Finance cho XAG/USD (Silver) ---
 YF_INTERVAL_MAP = {
-    "15min": ("15m", "5d"),
-    "30min": ("30m", "5d"),
-    "1h":   ("60m", "30d"),
-    # Yahoo không có 2h/4h trực tiếp -> dùng 60m rồi resample
-    "2h":   ("60m", "60d"),
-    "4h":   ("60m", "60d"),
+    "15min": ("15m", "30d"),   # 15m cho 30 ngày
+    "30min": ("30m", "60d"),   # 30m cho 60 ngày
+    "1h":    ("60m", "60d"),   # 60m cho 60 ngày
+    "2h":    ("60m", "60d"),   # resample từ 60m
+    "4h":    ("60m", "60d"),   # resample từ 60m
 }
 
 def fetch_candles_yf(ticker, interval):
     """
-    Lấy dữ liệu từ Yahoo Finance (không cần API key).
-    Trả về df OHLC; nếu interval là 2h/4h thì resample từ 60m.
+    Lấy nến từ Yahoo Finance (không cần API key).
+    Trả về df OHLC; với 2h/4h sẽ resample từ 60m.
     """
     if interval not in YF_INTERVAL_MAP:
         return None
-    yf_iv, yf_range = YF_INTERVAL_MAP[interval]
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={yf_iv}&range={yf_range}"
-    try:
-        r = requests.get(url, timeout=12)
-        j = r.json()
-        result = j.get("chart", {}).get("result", [])
-        if not result:
-            logging.warning(f"YF no result {ticker}-{interval}: {j}")
-            return None
-        res = result[0]
-        ts = res.get("timestamp")
-        quote = res.get("indicators", {}).get("quote", [{}])[0]
-        if not ts or not quote:
-            logging.warning(f"YF empty series {ticker}-{interval}")
-            return None
-        df = pd.DataFrame({
-            "datetime": pd.to_datetime(ts, unit="s", utc=True),
-            "open": quote.get("open"),
-            "high": quote.get("high"),
-            "low": quote.get("low"),
-            "close": quote.get("close"),
-        })
-        df = _finish_df(df)
-        if df is None:
-            return None
 
-        # Resample cho 2h/4h nếu cần
-        if interval in ("2h", "4h"):
-            rule = "2H" if interval == "2h" else "4H"
-            df = (df.set_index("datetime")
-                    .resample(rule, label="right", closed="right")
-                    .agg({"open":"first", "high":"max", "low":"min", "close":"last"})
-                    .dropna()
-                    .reset_index())
-        return df
-    except Exception as e:
-        logging.error(f"YF fetch error {ticker}-{interval}: {e}")
-        return None
+    yf_iv, yf_range = YF_INTERVAL_MAP[interval]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Connection": "keep-alive",
+    }
+
+    # Thử lần lượt query1 rồi query2
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        url = f"https://{host}/v8/finance/chart/{ticker}?interval={yf_iv}&range={yf_range}"
+        try:
+            r = requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                logging.warning(f"YF {ticker}-{interval} HTTP {r.status_code}: {r.text[:120]!r}")
+                continue
+
+            j = r.json()
+            err = (j.get("chart") or {}).get("error")
+            if err:
+                logging.warning(f"YF {ticker}-{interval} error: {err}")
+                continue
+
+            result = (j.get("chart") or {}).get("result") or []
+            if not result:
+                logging.warning(f"YF {ticker}-{interval} empty result")
+                continue
+
+            res = result[0]
+            ts = res.get("timestamp")
+            quote = (res.get("indicators") or {}).get("quote") or [{}]
+            quote = quote[0] if quote else {}
+            if not ts or not quote:
+                logging.warning(f"YF {ticker}-{interval} missing series")
+                continue
+
+            df = pd.DataFrame({
+                "datetime": pd.to_datetime(ts, unit="s", utc=True),
+                "open": quote.get("open"),
+                "high": quote.get("high"),
+                "low":  quote.get("low"),
+                "close": quote.get("close"),
+            })
+
+            # Chuẩn hóa, đổi TZ
+            df = df.dropna(subset=["open", "high", "low", "close"])
+            df["datetime"] = df["datetime"].dt.tz_convert(TIMEZ)
+            df = df.sort_values("datetime").reset_index(drop=True)
+
+            # Resample cho 2h/4h
+            if interval in ("2h", "4h"):
+                rule = "2H" if interval == "2h" else "4H"
+                df = (df.set_index("datetime")
+                        .resample(rule, label="right", closed="right")
+                        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
+                        .dropna()
+                        .reset_index())
+            # Định dạng giống TD
+            return df[["datetime", "open", "high", "low", "close"]]
+
+        except Exception as e:
+            logging.error(f"YF fetch error {ticker}-{interval}: {e}")
+            continue  # thử host kế tiếp
+
+    # cả 2 host đều fail
+    return None
 
 def fetch_candles(symbol_display, interval):
     """
