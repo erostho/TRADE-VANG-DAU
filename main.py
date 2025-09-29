@@ -92,10 +92,11 @@ def analyze_symbol(name, symbol):
             trend = get_trend(df)
             trends.append(f"{iv}:{trend}")
             time.sleep(60.0 / RPM)
+
         if len(intervals) == 1:
             results[group] = trends[0].split(":")[1]
         else:
-            uniq = set([t.split(":")[1] for t in trends])
+            uniq = set(t.split(":")[1] for t in trends)
             if len(uniq) == 1:
                 results[group] = uniq.pop()
             else:
@@ -105,16 +106,23 @@ def analyze_symbol(name, symbol):
     df1h = fetch_candles(symbol, "1h")
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
+    has_data = False
+
     if df1h is not None and len(df1h) > 20:
         bias = get_trend(df1h)
+        # coi 1H có dữ liệu hợp lệ
+        if bias != "N/A":
+            has_data = True
+
         entry = df1h["close"].iloc[-1]
         atrval = atr(df1h, 14)
 
-        # Xác định hệ số ATR theo loại symbol
-        if any(x in name for x in ["EUR/USD", "USD/JPY"]):
-            atr_mult = 2.5   # Forex
+        # Hệ số ATR: Forex 2.5, còn lại 1.5
+        forex_set = {"EUR/USD", "USD/JPY"}  # giữ đúng 2 cặp bạn đang dùng
+        if (symbol in forex_set) or any(k in name for k in forex_set):
+            atr_mult = 2.5
         else:
-            atr_mult = 1.5   # BTC, Vàng, Dầu
+            atr_mult = 1.5
 
         if bias == "LONG":
             plan = "LONG"
@@ -125,7 +133,8 @@ def analyze_symbol(name, symbol):
             sl = entry + atr_mult * atrval
             tp = entry - atr_mult * atrval
 
-    return results, plan, entry, sl, tp, atrval
+    # TRẢ VỀ 7 GIÁ TRỊ như main đang unpack
+    return results, plan, entry, sl, tp, atrval, has_data
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
