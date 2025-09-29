@@ -83,21 +83,15 @@ def get_trend(df):
         return "SHORT"
     else:
         return "SIDEWAY"
-
 def analyze_symbol(name, symbol):
     results = {}
-    has_data = False  # <--- thêm cờ có dữ liệu
-
     for group, intervals in interval_groups.items():
         trends = []
         for iv in intervals:
             df = fetch_candles(symbol, iv)
             trend = get_trend(df)
             trends.append(f"{iv}:{trend}")
-            if trend != "N/A":
-                has_data = True  # <--- nếu có bất kỳ khung nào có dữ liệu
-            time.sleep(60.0/RPM)
-        # Nếu 1 interval -> trực tiếp
+            time.sleep(60.0 / RPM)
         if len(intervals) == 1:
             results[group] = trends[0].split(":")[1]
         else:
@@ -113,18 +107,23 @@ def analyze_symbol(name, symbol):
     entry = sl = tp = atrval = None
     if df1h is not None and len(df1h) > 20:
         bias = get_trend(df1h)
-        if bias != "N/A":
-            has_data = True  # <--- 1H cũng là dữ liệu hợp lệ
         entry = df1h["close"].iloc[-1]
         atrval = atr(df1h, 14)
+
+        # Xác định hệ số ATR theo loại symbol
+        if any(x in name for x in ["EUR/USD", "USD/JPY"]):
+            atr_mult = 2.5   # Forex
+        else:
+            atr_mult = 1.5   # BTC, Vàng, Dầu
+
         if bias == "LONG":
             plan = "LONG"
-            sl = entry - 2.0*atrval
-            tp = entry + 2.0*atrval
+            sl = entry - atr_mult * atrval
+            tp = entry + atr_mult * atrval
         elif bias == "SHORT":
             plan = "SHORT"
-            sl = entry + 2.0*atrval
-            tp = entry - 2.0*atrval
+            sl = entry + atr_mult * atrval
+            tp = entry - atr_mult * atrval
 
     return results, plan, entry, sl, tp, atrval, has_data  # <--- trả thêm cờ
 
