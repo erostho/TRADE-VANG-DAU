@@ -5,6 +5,7 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -203,12 +204,16 @@ def send_telegram(msg):
         logging.error(f"Telegram send failed: {e}")
 
 # ================= MAIN =================
+#def main():
+    #lines = []
+    #now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    #lines.append("💵 TRADE GOODS")
+    #lines.append(f"⏱ {now}\n")
 def main():
     lines = []
-    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d %H:%M:%S")
     lines.append("💵 TRADE GOODS")
     lines.append(f"⏱ {now}\n")
-
     any_symbol_has_data = False  # <--- tổng hợp cờ
 
     for name, sym in symbols.items():
