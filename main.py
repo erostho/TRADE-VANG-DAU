@@ -4,7 +4,7 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # ================= LOGGING =================
 logging.basicConfig(
@@ -18,170 +18,50 @@ API_KEY = os.getenv("TWELVE_DATA_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-TD_BASE_URL = "https://api.twelvedata.com/time_series"
+BASE_URL = "https://api.twelvedata.com/time_series"
 TIMEZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")
-RPM = int(os.getenv("RPM", 7))  # requests per minute (throttle)
 
-# Symbols để hiển thị -> mã TwelveData (mặc định)
-SYMBOLS_TD = {
+# Request per minute throttle
+RPM = int(os.getenv("RPM", 7))
+
+symbols = {
     "Bitcoin": "BTC/USD",
-    "Ethereum": "ETH/USD",
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
+    "EUR/USD": "EUR/USD",
     "USD/JPY": "USD/JPY",
-    # Silver (Bạc) trên TD (dùng làm fallback)
-    "XAG/USD (Silver)": "XAG/USD",
 }
 
-# Riêng Bạc dùng Yahoo Finance làm nguồn chính (ngoài TV/TD)
-# Yahoo ticker cho Bạc spot: XAGUSD=X
-SYMBOLS_YF = {
-    "XAG/USD (Silver)": "XAGUSD=X",
-}
-
-# Nhóm khung nến (GIỮ NGUYÊN)
-INTERVAL_GROUPS = {
+interval_groups = {
     "15m-30m": ["15min", "30min"],
     "1H-2H": ["1h", "2h"],
     "4H": ["4h"]
 }
 
 # ================= HELPERS =================
-def _finish_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Chuẩn hóa df OHLC (datetime tăng dần, cột float)."""
-    if df is None or df.empty:
-        return None
-    df = df.copy()
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(TIMEZ)
-    df = df.sort_values("datetime").reset_index(drop=True)
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close"])
-    return df if not df.empty else None
-
-def fetch_candles_td(symbol, interval, retries=3):
-    """Lấy nến từ Twelve Data (mặc định cho các symbol khác)."""
-    url = f"{TD_BASE_URL}?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize=200"
-    for _ in range(retries):
+def fetch_candles(symbol, interval, retries=3):
+    url = f"{BASE_URL}?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize=100"
+    for attempt in range(retries):
         try:
-            r = requests.get(url, timeout=12)
+            r = requests.get(url, timeout=10)
             if r.status_code == 429:
-                logging.warning(f"TD rate limit {symbol}-{interval}, sleep 65s...")
+                logging.warning(f"Rate limit hit for {symbol}-{interval}, sleeping 65s then retry...")
                 time.sleep(65)
                 continue
             data = r.json()
             if "values" not in data:
-                logging.warning(f"TD no data {symbol}-{interval}: {data}")
+                logging.warning(f"No data for {symbol}-{interval}: {data}")
                 return None
-            rows = data["values"]
-            df = pd.DataFrame(rows)[["datetime", "open", "high", "low", "close"]]
-            return _finish_df(df)
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.sort_values("datetime").reset_index(drop=True)
+            for col in ["open", "high", "low", "close"]:
+                df[col] = pd.to_numeric(df[col])
+            return df
         except Exception as e:
-            logging.error(f"TD fetch error {symbol}-{interval}: {e}")
+            logging.error(f"Fetch error {symbol}-{interval}: {e}")
             time.sleep(3)
     return None
-
-# ---------- Yahoo Finance (dành cho Bạc) ----------
-# Map interval của mình -> Yahoo interval và range tối thiểu
-# --- Yahoo Finance cho XAG/USD (Silver) ---
-YF_INTERVAL_MAP = {
-    "15min": ("15m", "30d"),   # 15m cho 30 ngày
-    "30min": ("30m", "60d"),   # 30m cho 60 ngày
-    "1h":    ("60m", "60d"),   # 60m cho 60 ngày
-    "2h":    ("60m", "60d"),   # resample từ 60m
-    "4h":    ("60m", "60d"),   # resample từ 60m
-}
-
-def fetch_candles_yf(ticker, interval):
-    """
-    Lấy nến từ Yahoo Finance (không cần API key).
-    Trả về df OHLC; với 2h/4h sẽ resample từ 60m.
-    """
-    if interval not in YF_INTERVAL_MAP:
-        return None
-
-    yf_iv, yf_range = YF_INTERVAL_MAP[interval]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Connection": "keep-alive",
-    }
-
-    # Thử lần lượt query1 rồi query2
-    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
-        url = f"https://{host}/v8/finance/chart/{ticker}?interval={yf_iv}&range={yf_range}"
-        try:
-            r = requests.get(url, headers=headers, timeout=12)
-            if r.status_code != 200:
-                logging.warning(f"YF {ticker}-{interval} HTTP {r.status_code}: {r.text[:120]!r}")
-                continue
-
-            j = r.json()
-            err = (j.get("chart") or {}).get("error")
-            if err:
-                logging.warning(f"YF {ticker}-{interval} error: {err}")
-                continue
-
-            result = (j.get("chart") or {}).get("result") or []
-            if not result:
-                logging.warning(f"YF {ticker}-{interval} empty result")
-                continue
-
-            res = result[0]
-            ts = res.get("timestamp")
-            quote = (res.get("indicators") or {}).get("quote") or [{}]
-            quote = quote[0] if quote else {}
-            if not ts or not quote:
-                logging.warning(f"YF {ticker}-{interval} missing series")
-                continue
-
-            df = pd.DataFrame({
-                "datetime": pd.to_datetime(ts, unit="s", utc=True),
-                "open": quote.get("open"),
-                "high": quote.get("high"),
-                "low":  quote.get("low"),
-                "close": quote.get("close"),
-            })
-
-            # Chuẩn hóa, đổi TZ
-            df = df.dropna(subset=["open", "high", "low", "close"])
-            df["datetime"] = df["datetime"].dt.tz_convert(TIMEZ)
-            df = df.sort_values("datetime").reset_index(drop=True)
-
-            # Resample cho 2h/4h
-            if interval in ("2h", "4h"):
-                rule = "2H" if interval == "2h" else "4H"
-                df = (df.set_index("datetime")
-                        .resample(rule, label="right", closed="right")
-                        .agg({"open": "first", "high": "max", "low": "min", "close": "last"})
-                        .dropna()
-                        .reset_index())
-            # Định dạng giống TD
-            return df[["datetime", "open", "high", "low", "close"]]
-
-        except Exception as e:
-            logging.error(f"YF fetch error {ticker}-{interval}: {e}")
-            continue  # thử host kế tiếp
-
-    # cả 2 host đều fail
-    return None
-
-def fetch_candles(symbol_display, interval):
-    """
-    Router: nếu là Bạc -> dùng Yahoo trước, rồi fallback TwelveData.
-    Ngược lại: dùng TwelveData.
-    """
-    if symbol_display in SYMBOLS_YF:
-        # nguồn chính: Yahoo
-        df = fetch_candles_yf(SYMBOLS_YF[symbol_display], interval)
-        if df is not None and len(df) > 0:
-            return df
-        # fallback TD
-        logging.info(f"Fallback TD for {symbol_display}-{interval}")
-        return fetch_candles_td(SYMBOLS_TD[symbol_display], interval)
-    else:
-        return fetch_candles_td(SYMBOLS_TD[symbol_display], interval)
 
 def atr(df, period=14):
     high = df["high"].values
@@ -189,7 +69,7 @@ def atr(df, period=14):
     close = df["close"].shift(1).fillna(df["close"])
     tr = np.maximum(high - low, np.maximum(abs(high - close), abs(low - close)))
     atr_vals = pd.Series(tr).rolling(period).mean()
-    return float(atr_vals.iloc[-1])
+    return atr_vals.iloc[-1]
 
 def get_trend(df):
     if df is None or len(df) < 20:
@@ -204,48 +84,56 @@ def get_trend(df):
     else:
         return "SIDEWAY"
 
-def analyze_symbol(name, symbol_display):
+def analyze_symbol(name, symbol):
     results = {}
-    for group, intervals in INTERVAL_GROUPS.items():
+    has_data = False  # <--- thêm cờ có dữ liệu
+
+    for group, intervals in interval_groups.items():
         trends = []
         for iv in intervals:
-            df = fetch_candles(symbol_display, iv)
+            df = fetch_candles(symbol, iv)
             trend = get_trend(df)
             trends.append(f"{iv}:{trend}")
-            time.sleep(60.0 / RPM)  # GIỮ NHƯ CŨ để không vượt quota
+            if trend != "N/A":
+                has_data = True  # <--- nếu có bất kỳ khung nào có dữ liệu
+            time.sleep(60.0/RPM)
+        # Nếu 1 interval -> trực tiếp
         if len(intervals) == 1:
             results[group] = trends[0].split(":")[1]
         else:
-            uniq = set(t.split(":")[1] for t in trends)
+            uniq = set([t.split(":")[1] for t in trends])
             if len(uniq) == 1:
                 results[group] = uniq.pop()
             else:
                 results[group] = "Mixed (" + ", ".join(trends) + ")"
 
-    # Entry/SL/TP từ 1H (GIỮ NGUYÊN LOGIC)
-    df1h = fetch_candles(symbol_display, "1h")
+    # Entry/SL/TP từ 1H
+    df1h = fetch_candles(symbol, "1h")
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
     if df1h is not None and len(df1h) > 20:
         bias = get_trend(df1h)
-        entry = float(df1h["close"].iloc[-1])
+        if bias != "N/A":
+            has_data = True  # <--- 1H cũng là dữ liệu hợp lệ
+        entry = df1h["close"].iloc[-1]
         atrval = atr(df1h, 14)
         if bias == "LONG":
             plan = "LONG"
-            sl = entry - 1.5 * atrval
-            tp = entry + 1.5 * atrval
+            sl = entry - 1.5*atrval
+            tp = entry + 1.5*atrval
         elif bias == "SHORT":
             plan = "SHORT"
-            sl = entry + 1.5 * atrval
-            tp = entry - 1.5 * atrval
-    return results, plan, entry, sl, tp, atrval
+            sl = entry + 1.5*atrval
+            tp = entry - 1.5*atrval
 
-def send_telegram(msg: str):
+    return results, plan, entry, sl, tp, atrval, has_data  # <--- trả thêm cờ
+
+def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("Telegram not configured")
         return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         r = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
         if r.status_code != 200:
             logging.error(f"Telegram error: {r.text}")
@@ -259,14 +147,24 @@ def main():
     lines.append("💵 TRADE GOODS")
     lines.append(f"⏱ {now}\n")
 
-    for name, _td_code in SYMBOLS_TD.items():
-        results, plan, entry, sl, tp, atrval = analyze_symbol(name, name)
+    any_symbol_has_data = False  # <--- tổng hợp cờ
+
+    for name, sym in symbols.items():
+        results, plan, entry, sl, tp, atrval, has_data = analyze_symbol(name, sym)
+        if has_data:
+            any_symbol_has_data = True
+
         lines.append(f"==={name}===")
         for group, trend in results.items():
             lines.append(f"{group}: {trend}")
         if entry and sl and tp:
             lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
         lines.append("")
+
+    # Nếu TẤT CẢ đều N/A -> KHÔNG gửi
+    if not any_symbol_has_data:
+        logging.info("Skip Telegram: all symbols/timeframes are N/A")
+        return
 
     msg = "\n".join(lines)
     send_telegram(msg)
