@@ -26,7 +26,7 @@ RPM = int(os.getenv("RPM", 7))
 
 symbols = {
     "Bitcoin": "BTC/USD",
-    "Ethereum": "ETH/USD",
+    "XAG/USD (Silver)": "XAG/USD",
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
     "USD/JPY": "USD/JPY",
