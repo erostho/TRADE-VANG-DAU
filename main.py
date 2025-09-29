@@ -119,12 +119,12 @@ def analyze_symbol(name, symbol):
         atrval = atr(df1h, 14)
         if bias == "LONG":
             plan = "LONG"
-            sl = entry - 1.5*atrval
-            tp = entry + 1.5*atrval
+            sl = entry - 2.0*atrval
+            tp = entry + 2.0*atrval
         elif bias == "SHORT":
             plan = "SHORT"
-            sl = entry + 1.5*atrval
-            tp = entry - 1.5*atrval
+            sl = entry + 2.0*atrval
+            tp = entry - 2.0*atrval
 
     return results, plan, entry, sl, tp, atrval, has_data  # <--- trả thêm cờ
 
