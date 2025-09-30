@@ -23,7 +23,7 @@ BASE_URL = "https://api.twelvedata.com/time_series"
 TIMEZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")
 
 # Request per minute throttle
-RPM = int(os.getenv("RPM", 7))
+RPM = int(os.getenv("RPM", 6))
 
 symbols = {
     "Bitcoin": "BTC/USD",
@@ -206,6 +206,7 @@ def main():
         if entry and sl and tp:
             lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
         lines.append("")
+        time.sleep(10)
 
     # Nếu TẤT CẢ đều N/A -> KHÔNG gửi
     if not any_symbol_has_data:
