@@ -194,24 +194,24 @@ def main():
     any_symbol_has_data = False  # <--- tổng hợp cờ
 
     for name, sym in symbols.items():
-    results, plan, entry, sl, tp, atrval, has_data = analyze_symbol(name, sym)
-    if not has_data:
-        continue
-
-    lines.append(f"==={name}===")
-
-    # in các nhóm khung nến hiện tại
-    group_lines = []
-    for group, trend in results.items():
-        group_lines.append(f"{group}: {trend}")
-    lines.extend(group_lines)
-
-    # CHỈ 1 DÒNG "1h qua" CHO MỖI SYMBOL
-    lines.append(f"15m-30m (1h qua): {recent_1h_trend_15_30(sym)}")
-
-    if entry is not None and sl is not None and tp is not None:
-        lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
-    lines.append("")
+        results, plan, entry, sl, tp, atrval, has_data = analyze_symbol(name, sym)
+        if not has_data:
+            continue
+    
+        lines.append(f"==={name}===")
+    
+        # in các nhóm khung nến hiện tại
+        group_lines = []
+        for group, trend in results.items():
+            group_lines.append(f"{group}: {trend}")
+        lines.extend(group_lines)
+    
+        # CHỈ 1 DÒNG "1h qua" CHO MỖI SYMBOL
+        lines.append(f"15m-30m (1h qua): {recent_1h_trend_15_30(sym)}")
+    
+        if entry is not None and sl is not None and tp is not None:
+            lines.append(f"Entry {entry:.2f} | SL {sl:.2f} | TP {tp:.2f}")
+        lines.append("")
 
     # Nếu TẤT CẢ đều N/A -> KHÔNG gửi
     if not any_symbol_has_data:
