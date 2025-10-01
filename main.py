@@ -71,7 +71,72 @@ def atr(df, period=14):
     tr = np.maximum(high - low, np.maximum(abs(high - close), abs(low - close)))
     atr_vals = pd.Series(tr).rolling(period).mean()
     return atr_vals.iloc[-1]
+def ema(series, n):
+    return series.ewm(span=n, adjust=False).mean()
 
+def adx(df, n=14):
+    if df is None or len(df) < n + 20:
+        return np.nan
+    up = df['high'].diff()
+    dn = -df['low'].diff()
+    plus  = np.where((up > dn) & (up > 0), up, 0.0)
+    minus = np.where((dn > up) & (dn > 0), dn, 0.0)
+
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['close'].shift()).abs()
+    tr3 = (df['low']  - df['close'].shift()).abs()
+    tr  = np.maximum(tr1, np.maximum(tr2, tr3))
+    atr_ = pd.Series(tr).rolling(n).mean()
+
+    plus_di  = 100 * pd.Series(plus).rolling(n).mean()  / atr_
+    minus_di = 100 * pd.Series(minus).rolling(n).mean() / atr_
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    return dx.rolling(n).mean().iloc[-1]
+
+def strong_trend(df):
+    """Lọc nhiễu: EMA(20/50) + vị trí giá + ADX + slope."""
+    if df is None or len(df) < 60:
+        return "N/A"
+    e20 = ema(df['close'], 20)
+    e50 = ema(df['close'], 50)
+    last = df['close'].iloc[-1]
+    adx_val = adx(df, 14)
+    # slope % của EMA20 trên 5 nến gần nhất
+    if len(e20) < 6 or np.isnan(adx_val):
+        return "N/A"
+    slope = (e20.iloc[-1] - e20.iloc[-6]) / max(1e-9, e20.iloc[-6]) * 100
+
+    if (e20.iloc[-1] > e50.iloc[-1]) and (last > e20.iloc[-1]) and (adx_val >= 20) and (slope > 0.02):
+        return "LONG"
+    if (e20.iloc[-1] < e50.iloc[-1]) and (last < e20.iloc[-1]) and (adx_val >= 20) and (slope < -0.02):
+        return "SHORT"
+    return "SIDEWAY"
+
+def swing_levels(df, lookback=20):
+    """Lấy swing gần nhất (đỉnh/đáy trước nến hiện tại)."""
+    if df is None or len(df) < lookback + 2:
+        return (np.nan, np.nan)
+    swing_hi = df['high'].rolling(lookback).max().iloc[-2]
+    swing_lo = df['low' ].rolling(lookback).min().iloc[-2]
+    return swing_hi, swing_lo
+
+def confluence_score(results_dict):
+    """Điểm đồng thuận 0–3: 15–30, 1H–2H, 4H."""
+    g15_30 = results_dict.get("15m-30m", "N/A")
+    g1_2   = results_dict.get("1H-2H",   "N/A")
+    g4     = results_dict.get("4H",      "N/A")
+
+    def norm(x):  # lấy LONG/SHORT nếu Mixed
+        if x.startswith("Mixed"):
+            return "MIX"
+        return x
+
+    a, b, c = norm(g15_30), norm(g1_2), norm(g4)
+    score = 0
+    if a in ("LONG","SHORT") and b == a: score += 1
+    if b in ("LONG","SHORT") and c == b: score += 1
+    if a in ("LONG","SHORT") and c == a: score += 1
+    return score
 def get_trend(df):
     if df is None or len(df) < 20:
         return "N/A"
@@ -117,55 +182,74 @@ def recent_1h_trend_15_30(symbol):
 
 def analyze_symbol(name, symbol):
     results = {}
+    has_data = False
+
+    # 1) Tính trend cho từng khung
     for group, intervals in interval_groups.items():
         trends = []
         for iv in intervals:
             df = fetch_candles(symbol, iv)
-            trend = get_trend(df)
+            trend = strong_trend(df)
             trends.append(f"{iv}:{trend}")
-            time.sleep(60.0 / RPM)
-
+            time.sleep(60.0 / RPM)  # throttle
         if len(intervals) == 1:
-            results[group] = trends[0].split(":")[1]
+            res = trends[0].split(":")[1]
         else:
-            uniq = set(t.split(":")[1] for t in trends)
+            uniq = set([t.split(":")[1] for t in trends])
             if len(uniq) == 1:
-                results[group] = uniq.pop()
+                res = uniq.pop()
             else:
-                results[group] = "Mixed (" + ", ".join(trends) + ")"
+                res = "Mixed (" + ", ".join(trends) + ")"
+        results[group] = res
+        if res != "N/A":
+            has_data = True
 
-    # Entry/SL/TP từ 1H
+    # 2) Entry/SL/TP từ 1H (bám swing + ATR)
     df1h = fetch_candles(symbol, "1h")
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
-    has_data = False
 
-    if df1h is not None and len(df1h) > 20:
-        bias = get_trend(df1h)
-        # coi 1H có dữ liệu hợp lệ
+    if df1h is not None and len(df1h) > 40:
+        bias = strong_trend(df1h)
         if bias != "N/A":
-            has_data = True
+            has_data = True  # 1H có dữ liệu hợp lệ
 
-        entry = df1h["close"].iloc[-1]
+        entry  = df1h["close"].iloc[-1]
         atrval = atr(df1h, 14)
+        swing_hi, swing_lo = swing_levels(df1h, 20)
 
-        # Hệ số ATR: Forex 2.5, còn lại 1.5
-        forex_set = {"EUR/USD", "USD/JPY"}  # giữ đúng 2 cặp bạn đang dùng
-        if (symbol in forex_set) or any(k in name for k in forex_set):
-            atr_mult = 2.5
-        else:
-            atr_mult = 1.5
+        # hệ số ATR khác nhau
+        is_fx = name in ("EUR/USD", "USD/JPY")
+        base_mult = 2.5 if is_fx else 1.5
+        buf = 0.5 * atrval  # đệm để khỏi chạm đúng swing
 
         if bias == "LONG":
             plan = "LONG"
-            sl = entry - atr_mult * atrval
-            tp = entry + atr_mult * atrval
+            sl_candidates = [
+                entry - base_mult * atrval,
+                swing_lo - buf if not np.isnan(swing_lo) else entry - base_mult * atrval,
+            ]
+            sl = min(sl_candidates)  # lấy xa hơn để an toàn
+            r  = entry - sl
+            tp = entry + 1.4 * r     # TP ≈ 1.4R
         elif bias == "SHORT":
             plan = "SHORT"
-            sl = entry + atr_mult * atrval
-            tp = entry - atr_mult * atrval
+            sl_candidates = [
+                entry + base_mult * atrval,
+                swing_hi + buf if not np.isnan(swing_hi) else entry + base_mult * atrval,
+            ]
+            sl = max(sl_candidates)
+            r  = sl - entry
+            tp = entry - 1.4 * r
 
-    # TRẢ VỀ 7 GIÁ TRỊ như main đang unpack
+    # 3) (Tùy chọn) Nếu điểm đồng thuận quá thấp thì bỏ Entry/SL/TP
+    try:
+        score = confluence_score(results)  # 0..3
+        if score < 2:  # chưa đủ đồng thuận -> không khuyến nghị lệnh
+            entry = sl = tp = None
+    except Exception:
+        pass
+
     return results, plan, entry, sl, tp, atrval, has_data
 
 def send_telegram(msg):
