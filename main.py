@@ -326,21 +326,21 @@ def main():
     any_symbol_has_data = False
 
     for name, sym in symbols.items():
-    results, plan, entry, sl, tp, atrval, has_data = analyze_symbol(name, sym, daily_cache)
+        results, plan, entry, sl, tp, atrval, has_data = analyze_symbol(name, sym, daily_cache)
 
-    lines.append(f"==={name}===")
-    for group, trend in results.items():
-        lines.append(f"{group}: {trend}")
-
-    # >>> thêm dòng 1D trend
-    daily_trend = daily_cache.get("data", {}).get(sym, {}).get("trend", "N/A")
-    lines.append(f"1D: {daily_trend}")
-
-    if entry is not None and sl is not None and tp is not None:
-        lines.append(
-            f"Entry {format_price(sym, entry)} | SL {format_price(sym, sl)} | TP {format_price(sym, tp)}"
-        )
-    lines.append("")
+        lines.append(f"==={name}===")
+        for group, trend in results.items():
+            lines.append(f"{group}: {trend}")
+    
+        # >>> thêm dòng 1D trend
+        daily_trend = daily_cache.get("data", {}).get(sym, {}).get("trend", "N/A")
+        lines.append(f"1D: {daily_trend}")
+    
+        if entry is not None and sl is not None and tp is not None:
+            lines.append(
+                f"Entry {format_price(sym, entry)} | SL {format_price(sym, sl)} | TP {format_price(sym, tp)}"
+            )
+        lines.append("")
 
         # dàn request để không vượt quota
         time.sleep(10)
