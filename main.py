@@ -155,7 +155,69 @@ def swing_levels(df, lookback=20):
 
 # === 1D cache (fetch 1 lần/ngày lúc 00:05 VN) ===
 DAILY_CACHE_PATH = os.getenv("DAILY_CACHE_PATH", "daily_cache.json")
+from zoneinfo import ZoneInfo
+import json, os, time
 
+DAILY_CACHE_PATH = os.getenv("DAILY_CACHE_PATH", "daily_cache.json")
+
+def today_vn_str():
+    return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).date().isoformat()
+
+def load_daily_cache():
+    try:
+        with open(DAILY_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"date": None, "data": {}}
+
+def save_daily_cache(cache: dict):
+    tmp = DAILY_CACHE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False)
+    os.replace(tmp, DAILY_CACHE_PATH)
+
+def is_cache_fresh(cache: dict) -> bool:
+    return cache.get("date") == today_vn_str()
+
+def build_daily_cache(symbols_dict: dict) -> dict:
+    """
+    Gọi TwelveData 1D cho từng symbol, tính trend 1D bằng strong_trend/get_trend
+    và lưu vào cache. Chỉ dùng 1D -> quota ~ số symbol / ngày.
+    """
+    data = {}
+    for _, sym in symbols_dict.items():
+        df = fetch_candles(sym, "1day")
+        trend = strong_trend(df) if df is not None else "N/A"
+        if trend == "N/A":
+            # fallback đơn giản nếu EMA/ADX chưa đủ mẫu
+            trend = get_trend(df) if df is not None else "N/A"
+        data[sym] = {"trend": trend}
+        time.sleep(60.0 / RPM)  # tôn trọng quota
+    return {"date": today_vn_str(), "data": data}
+
+def ensure_daily_cache(symbols_dict: dict):
+    """
+    Nếu cache chưa có/hết hạn, CHỈ trong khung 00:04–00:15 (VN) mới tự build.
+    Ngoài khung đó: giữ nguyên (để không tốn quota).
+    Có thể ép build bằng ENV FORCE_BUILD_DAILY=1.
+    """
+    cache = load_daily_cache()
+    vn_now = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    force = os.getenv("FORCE_BUILD_DAILY", "0") == "1"
+
+    if is_cache_fresh(cache) and not force:
+        logging.info("1D cache fresh – dùng lại.")
+        return cache
+
+    in_window = (vn_now.hour == 0) and (4 <= vn_now.minute <= 15)
+    if in_window or force:
+        logging.info("Build 1D cache…")
+        new_cache = build_daily_cache(symbols_dict)
+        save_daily_cache(new_cache)
+        return new_cache
+    else:
+        logging.info("1D cache stale nhưng ngoài khung 00:04–00:15 – giữ nguyên.")
+        return cache
 def load_daily_cache():
     """Đọc cache 1D. Hỗ trợ cả schema cũ 'data' và mới '1D'."""
     try:
@@ -283,6 +345,9 @@ def analyze_symbol(name, symbol, daily_cache):
     bias_4h = strong_trend(df4h) if df4h is not None else "N/A"
 
     daily_trend = get_daily_trend(symbol, name, daily_cache)  # KHÔNG in ra Tele, chỉ dùng lọc
+    results["1D"] = daily_trend
+    if daily_trend != "N/A":
+        has_data = True
     # 3) Điểm tin cậy (0..4): (1H~4H), (15/30 khớp 1H), (ADX1H ok), (1D khớp 1H)
     score = 0
     if bias_1h in ("LONG","SHORT") and bias_1h == bias_4h:
@@ -348,7 +413,7 @@ def send_telegram(msg: str):
 # ================= MAIN =================
 def main():
     # load daily cache mỗi lần chạy
-    daily_cache = load_daily_cache()
+    daily_cache = ensure_daily_cache(symbols)  
 
     lines = []
     now_str = now_vn().strftime("%Y-%m-%d %H:%M:%S")
