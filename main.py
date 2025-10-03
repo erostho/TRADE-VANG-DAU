@@ -153,20 +153,48 @@ def swing_levels(df, lookback=20):
     swing_lo = df['low' ].rolling(lookback).min().iloc[-2]
     return float(swing_hi), float(swing_lo)
 
-# ===== 1D cache (fetch 1 lần/ngày lúc 00:05 VN) =====
+# === 1D cache (fetch 1 lần/ngày lúc 00:05 VN) ===
+DAILY_CACHE_PATH = os.getenv("DAILY_CACHE_PATH", "daily_cache.json")
+
 def load_daily_cache():
+    """Đọc cache 1D. Hỗ trợ cả schema cũ 'data' và mới '1D'."""
     try:
         with open(DAILY_CACHE_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cache = json.load(f)
+        # Chuẩn hoá về schema mới
+        if "1D" not in cache and "data" in cache:
+            cache["1D"] = cache.get("data", {})
+            cache.pop("data", None)
+        if "date" not in cache:
+            cache["date"] = None
+        if "1D" not in cache:
+            cache["1D"] = {}
+        return cache
     except Exception:
-        return {"date": None, "data": {}}
+        return {"date": None, "1D": {}}
 
 def save_daily_cache(cache):
+    """Ghi cache 1D với schema {'date': 'YYYY-MM-DD', '1D': {symbol: trend}}."""
     try:
         with open(DAILY_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(cache, f, ensure_ascii=False)
     except Exception as e:
-        logging.warning(f"Save daily cache failed: {e}")
+        logging.error(f"save_daily_cache error: {e}")
+
+def update_daily_cache(symbols):
+    """Fetch 1D cho TẤT CẢ symbol (chạy 00:05 mỗi ngày) và lưu cache."""
+    cache = {"date": datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d"), "1D": {}}
+    for name, sym in symbols.items():
+        try:
+            df = fetch_candles(sym, "1d")
+            trend = strong_trend(df)
+            cache["1D"][sym] = trend
+        except Exception as e:
+            logging.error(f"Daily fetch error {sym}: {e}")
+            cache["1D"][sym] = "N/A"
+        time.sleep(60.0 / RPM)  # tránh dồn API
+    save_daily_cache(cache)
+    return cache
 
 def should_fetch_daily(now: datetime, cache_date: str | None) -> bool:
     """
@@ -239,7 +267,11 @@ def analyze_symbol(name, symbol, daily_cache):
         results[group] = res
         if res != "N/A":
             has_data = True
-
+    # … bên trong analyze_symbol
+    if daily_cache and symbol in daily_cache.get("1D", {}):
+        results["1D"] = daily_cache["1D"][symbol]
+    else:
+        results["1D"] = "N/A"
     # 2) Khung chính 1H & 4H + 1D (từ cache)
     df1h = fetch_candles(symbol, "1h")
     time.sleep(60.0 / RPM)
