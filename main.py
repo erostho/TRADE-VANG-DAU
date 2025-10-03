@@ -365,8 +365,8 @@ def main():
             lines.append(f"{group}: {trend}")
     
         # >>> thêm dòng 1D trend
-        daily_trend = daily_cache.get("data", {}).get(sym, {}).get("trend", "N/A")
-        lines.append(f"1D: {daily_trend}")
+        #daily_trend = daily_cache.get("data", {}).get(sym, {}).get("trend", "N/A")
+        #lines.append(f"1D: {daily_trend}")
     
         if entry is not None and sl is not None and tp is not None:
             lines.append(
