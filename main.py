@@ -350,6 +350,7 @@ def _extract_subdir(mixed_text: str, key: str) -> str:
         return "N/A"
     m = re.search(fr"{key}\s*:\s*(LONG|SHORT|SIDEWAY)", mixed_text, re.IGNORECASE)
     return m.group(1).upper() if m else "N/A"
+    
 def compact_label(group: str, trend: str) -> str:
     """Rút gọn Mixed(...) thành 'A-B' theo cặp khung; còn lại giữ nguyên."""
     if not isinstance(trend, str):
@@ -359,12 +360,12 @@ def compact_label(group: str, trend: str) -> str:
 
     up = trend.upper()
     if group == "15m-30m":
-        a = extract_subdir(up, "15MIN")
-        b = extract_subdir(up, "30MIN")
+        a = _extract_subdir(up, "15MIN")
+        b = _extract_subdir(up, "30MIN")
         return f"{a}-{b}" if a != "N/A" and b != "N/A" else "MIXED"
     if group == "1H-2H":
-        a = extract_subdir(up, "1H")
-        b = extract_subdir(up, "2H")
+        a = _extract_subdir(up, "1H")
+        b = _extract_subdir(up, "2H")
         return f"{a}-{b}" if a != "N/A" and b != "N/A" else "MIXED"
     return "MIXED"
 def detect_pullback(results: dict) -> str:
