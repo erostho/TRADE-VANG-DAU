@@ -327,7 +327,94 @@ def decide_with_memory(sym, raw_dir, raw_conf, state):
     final_conf = smoothed_conf
     state[sym]["conf"] = final_conf
     return final_dir, final_conf
+import re
 
+def _norm_dir(x: str) -> str:
+    """Chuẩn hoá text trend về LONG/SHORT/SIDEWAY/N/A."""
+    if not isinstance(x, str): 
+        return "N/A"
+    x = x.upper()
+    if x.startswith("MIXED"): 
+        return "MIXED"
+    for t in ("LONG","SHORT","SIDEWAY"):
+        if t in x: 
+            return t
+    return "N/A"
+
+def _extract_subdir(mixed_text: str, key: str) -> str:
+    """
+    Lấy hướng của 1 khung trong chuỗi Mixed, ví dụ 'Mixed (1h:LONG, 2h:SHORT)'
+    key = '1h' hoặc '2h'
+    """
+    if not isinstance(mixed_text, str): 
+        return "N/A"
+    m = re.search(fr"{key}\s*:\s*(LONG|SHORT|SIDEWAY)", mixed_text, re.IGNORECASE)
+    return m.group(1).upper() if m else "N/A"
+def compact_label(group: str, trend: str) -> str:
+    """Rút gọn Mixed(...) thành 'A-B' theo cặp khung; còn lại giữ nguyên."""
+    if not isinstance(trend, str):
+        return "N/A"
+    if not trend.upper().startswith("MIXED"):
+        return trend
+
+    up = trend.upper()
+    if group == "15m-30m":
+        a = extract_subdir(up, "15MIN")
+        b = extract_subdir(up, "30MIN")
+        return f"{a}-{b}" if a != "N/A" and b != "N/A" else "MIXED"
+    if group == "1H-2H":
+        a = extract_subdir(up, "1H")
+        b = extract_subdir(up, "2H")
+        return f"{a}-{b}" if a != "N/A" and b != "N/A" else "MIXED"
+    return "MIXED"
+def detect_pullback(results: dict) -> str:
+    """
+    Trả về '', hoặc 'UP', 'DOWN'
+    - Pullback DOWN: 4H==LONG & 1H==SHORT
+    - Pullback UP  : 4H==SHORT & 1H==LONG
+    Ưu tiên 1D nếu có (1D trùng 4H thì cảnh báo mạnh hơn – mình chỉ trả hướng để bạn in).
+    """
+    g12 = results.get("1H-2H", "N/A")
+    d4  = _norm_dir(results.get("4H", "N/A"))
+    d1  = _norm_dir(results.get("1D", "N/A"))
+
+    # Lấy hướng 1H trong group 1H-2H
+    if _norm_dir(g12) == "MIXED":
+        d1h = _extract_subdir(g12, "1h")
+    else:
+        d1h = _norm_dir(g12)
+
+    if d4 == "LONG" and d1h == "SHORT":
+        return "DOWN"   # pullback giảm trong xu hướng tăng
+    if d4 == "SHORT" and d1h == "LONG":
+        return "UP"     # pullback tăng trong xu hướng giảm
+    return ""
+CONFIRM_STRONG = 70   # >=70%: mạnh
+CONFIRM_OK     = 55   # 55–69%: trung bình
+
+def decide_signal_color(results: dict, final_dir: str, final_conf: int):
+    """
+    Trả về (emoji, label_size)
+    - 🟢 'FULL'    : final_conf>=70 và 4H trùng final_dir và (1D trùng hoặc N/A)
+    - 🟡 'HALF'    : final_conf 55–69, hoặc 1H ngược 4H nhưng 4H==final_dir
+    - 🔴 'SKIP'    : còn lại
+    """
+    d4  = _norm_dir(results.get("4H", "N/A"))
+    d1  = _norm_dir(results.get("1D", "N/A"))
+    g12 = results.get("1H-2H", "N/A")
+    d1h = _extract_subdir(g12, "1h") if _norm_dir(g12)=="MIXED" else _norm_dir(g12)
+
+    # GREEN – mạnh
+    if final_dir in ("LONG","SHORT") and final_conf >= CONFIRM_STRONG \
+       and d4 == final_dir and d1 in (final_dir, "N/A"):
+        return "🟢", "FULL"
+
+    # YELLOW – trung bình
+    if (CONFIRM_OK <= final_conf < CONFIRM_STRONG) or (d4 == final_dir and d1h not in ("N/A","SIDEWAY") and d1h != d4):
+        return "🟡", "HALF"
+
+    # RED – yếu/không rõ
+    return "🔴", "SKIP"
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -458,8 +545,21 @@ def main():
 
         lines.append(f"==={name}===")
         for group, trend in results.items():
-            lines.append(f"{group}: {trend}")
+            lines.append(f"{group}: {compact_label(group, trend)}")
 
+        # —— Pullback & Color
+        pb = detect_pullback(results)
+        emoji, size_label = decide_signal_color(results, final_dir, int(round(final_conf)))
+        
+        regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
+        if pb == "DOWN":
+            lines.append("⚠️ Pullback: 1H ngược 4H/1D (DOWN) – cân nhắc chờ xác nhận")
+        elif pb == "UP":
+            lines.append("⚠️ Pullback: 1H ngược 4H/1D (UP) – cân nhắc chờ xác nhận")
+        
+        # dòng Confidence có màu & size gợi ý
+        lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime} | Size: {size_label}")
+        
         # thêm Confidence + Regime (không ảnh hưởng logic cũ)
         regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
         lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
