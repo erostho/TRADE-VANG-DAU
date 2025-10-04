@@ -498,7 +498,7 @@ def analyze_symbol(name, symbol, daily_cache):
             sl = min(sl_candidates)
             R  = entry - sl
             # kẹp TP: nhỏ hơn giữa 1.2R và 1.5*ATR
-            tp_dist = min(1.2*R, 1.5*atrval)
+            tp_dist = min(1.5*R, 2.0*atrval)
             tp = entry + tp_dist
 
         elif final_dir == "SHORT" and final_conf >= CONF_THRESHOLD:
