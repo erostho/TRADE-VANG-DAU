@@ -42,7 +42,14 @@ interval_groups = {
     "1H-2H": ["1h", "2h"],
     "4H": ["4h"]
 }
-
+# ====== STABILITY SETTINGS ======
+CONFIRM_TF = ["1h", "2h", "4h"]   # TF làm gốc cho Direction/Entry
+CONF_THRESHOLD = 60               # % tối thiểu để xuất Entry/SL/TP
+HYSTERESIS_PCT = 10               # chênh lệch % tối thiểu mới cho phép đảo chiều
+MIN_HOLD_MIN = 120                # phải giữ hướng tối thiểu 120 phút mới cho phép đảo
+COOLDOWN_MIN = 60                 # sau khi đảo, chờ 60 phút mới được đảo nữa
+STATE_PATH = os.getenv("STATE_PATH", "/tmp/signal_state.json")
+SMOOTH_ALPHA = 0.5                # làm mượt confidence giữa các lần chạy (0..1)
 # ================ HELPERS ================
 def fetch_candles(symbol, interval, retries=3):
     url = f"{BASE_URL}?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize=200"
@@ -262,6 +269,65 @@ def maybe_refresh_daily_cache():
     save_daily_cache(cache)
     return cache
 
+import json
+from datetime import datetime, timezone
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_state(state):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception as e:
+        logging.warning(f"save_state failed: {e}")
+
+def smooth_conf(prev_conf, curr_conf):
+    if prev_conf is None or np.isnan(prev_conf):
+        return curr_conf
+    return SMOOTH_ALPHA*curr_conf + (1.0-SMOOTH_ALPHA)*prev_conf
+
+def decide_with_memory(sym, raw_dir, raw_conf, state):
+    """Áp dụng hysteresis/min-hold/cooldown + làm mượt confidence."""
+    now = datetime.now(timezone.utc)
+    s = state.get(sym, {})
+    prev_dir  = s.get("dir")
+    prev_conf = s.get("conf")
+    prev_ts_s = s.get("ts")
+    prev_ts   = datetime.fromisoformat(prev_ts_s) if prev_ts_s else None
+
+    # mượt hoá confidence
+    smoothed_conf = smooth_conf(prev_conf, raw_conf if raw_conf is not None else 0)
+
+    # lần đầu chưa có state
+    if prev_dir is None or prev_ts is None:
+        final_dir  = raw_dir
+        final_conf = smoothed_conf
+        state[sym] = {"dir": final_dir, "conf": final_conf, "ts": now.isoformat()}
+        return final_dir, final_conf
+
+    held_min = (now - prev_ts).total_seconds() / 60.0
+    flip = (raw_dir in ("LONG","SHORT")) and (prev_dir in ("LONG","SHORT")) and (raw_dir != prev_dir)
+    big_enough_move = abs((smoothed_conf or 0) - (prev_conf or 0)) >= HYSTERESIS_PCT
+    can_flip_time   = held_min >= MIN_HOLD_MIN and held_min >= COOLDOWN_MIN
+
+    if flip and big_enough_move and can_flip_time:
+        # chấp nhận đảo chiều
+        final_dir  = raw_dir
+        final_conf = smoothed_conf
+        state[sym] = {"dir": final_dir, "conf": final_conf, "ts": now.isoformat()}
+        return final_dir, final_conf
+
+    # giữ nguyên hướng trước
+    final_dir  = prev_dir
+    final_conf = smoothed_conf
+    state[sym]["conf"] = final_conf
+    return final_dir, final_conf
+
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -291,71 +357,75 @@ def analyze_symbol(name, symbol, daily_cache):
     daily_trend = daily_cache.get("data", {}).get(symbol, {}).get("trend", "N/A")
     results["1D"] = daily_trend
 
-    # 2) Confluence score đa khung có trọng số để quyết định entry
-    df1h = fetch_candles(symbol, "1h")
-    df2h = fetch_candles(symbol, "2h")
-    df4h = fetch_candles(symbol, "4h")
-    time.sleep(60.0 / RPM)  # throttle nhẹ
+    # ===== Sau khi đã có 'results' cho các khung =====
+    # Bỏ phiếu từ 1h/2h/4h (bỏ qua Mixed/N/A)
+    votes = []
+    for g in ["1H-2H", "4H"]:
+        v = results.get(g, "N/A")
+        if isinstance(v, str) and v.startswith("Mixed"):
+            continue
+        if v in ("LONG", "SHORT"):
+            votes.append(v)
 
-    bias1h = strong_trend(df1h)
-    bias2h = strong_trend(df2h)
-    bias4h = strong_trend(df4h)
-    # nếu daily có hướng rõ, coi như bias1d = daily_trend
-    bias1d = daily_trend
+    if votes.count("LONG") > votes.count("SHORT"):
+        raw_dir = "LONG"
+    elif votes.count("SHORT") > votes.count("LONG"):
+        raw_dir = "SHORT"
+    else:
+        raw_dir = "SIDEWAY"
 
-    s1h = score_frame(df1h, bias1h)
-    s2h = score_frame(df2h, bias2h)
-    s4h = score_frame(df4h, bias4h)
-    s1d = 0.0 if bias1d in ("N/A", "SIDEWAY") else 0.6  # 1D là bonus (không fetch lại)
-    # trọng số: 1H:0.3, 2H:0.3, 4H:0.3, 1D:0.1
-    score = 0.3*s1h + 0.3*s2h + 0.3*s4h + 0.1*s1d
-    confidence = int(round(score * 100))
+    # Tính confidence đơn giản (mỗi phiếu = 33%), bonus nếu 1D trùng
+    raw_conf = 0
+    raw_conf += 33 * votes.count(raw_dir)
+    d1 = results.get("1D", "N/A")
+    if d1 == raw_dir:
+        raw_conf += 20
+    raw_conf = max(0, min(100, raw_conf))
 
-    # 3) Entry/SL/TP kiểu pullback nếu đủ điểm
+    # Áp dụng hysteresis & memory
+    state = load_state()
+    final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
+    save_state(state)
+
+    # ===== Entry/SL/TP: chỉ khi đủ ngưỡng =====
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
-    regime = market_regime(df1h)
 
-    if df1h is not None and len(df1h) > 60:
-        bias = strong_trend(df1h) if daily_trend in ("N/A", "SIDEWAY") else daily_trend
-        if bias != "N/A":
-            has_data = True
+    df1h = fetch_candles(symbol, "1h")
+    if df1h is not None and len(df1h) > 40:
+        atrval = atr(df1h, 14)
+        entry  = df1h["close"].iloc[-1]
+        swing_hi, swing_lo = swing_levels(df1h, 20)  # giữ hàm swing_levels bạn đang có
 
-        # bắt buộc đạt ngưỡng confidence mới bật entry
-        if score >= 0.65 and bias in ("LONG","SHORT"):
-            entry_raw = float(df1h["close"].iloc[-1])
-            atrval = atr(df1h, 14)
-            swing_hi, swing_lo = swing_levels(df1h, 20)
-            kmid, kup, kdn = keltner_mid(df1h, 20, atr_mult=1.0)
+        # hệ số ATR (giữ quy ước cũ của bạn)
+        is_fx = name in ("EUR/USD", "USD/JPY")
+        base_mult = 2.5 if is_fx else 1.5
 
-            # hệ số ATR khác nhau
-            is_fx = name in ("EUR/USD", "USD/JPY")
-            base_mult = 2.5 if is_fx else 1.5
-            buf = 0.5 * atrval
+        if final_dir == "LONG" and final_conf >= CONF_THRESHOLD:
+            plan = "LONG"
+            sl_candidates = [
+                entry - base_mult*atrval,
+                swing_lo - 0.5*atrval if not np.isnan(swing_lo) else entry - base_mult*atrval
+            ]
+            sl = min(sl_candidates)
+            R  = entry - sl
+            # kẹp TP: nhỏ hơn giữa 1.2R và 1.5*ATR
+            tp_dist = min(1.2*R, 1.5*atrval)
+            tp = entry + tp_dist
 
-            if bias == "LONG":
-                plan = "LONG"
-                # entry pullback về keltner mid/ema20
-                entry = max(kmid, entry_raw)
-                sl_candidates = [
-                    entry - base_mult * atrval,
-                    (swing_lo - buf) if not np.isnan(swing_lo) else entry - base_mult * atrval,
-                ]
-                sl = min(sl_candidates)
-                r  = entry - sl
-                tp = entry + 1.6 * r  # RR ~ 1.6
-            elif bias == "SHORT":
-                plan = "SHORT"
-                entry = min(kmid, entry_raw)
-                sl_candidates = [
-                    entry + base_mult * atrval,
-                    (swing_hi + buf) if not np.isnan(swing_hi) else entry + base_mult * atrval,
-                ]
-                sl = max(sl_candidates)
-                r  = sl - entry
-                tp = entry - 1.6 * r
+        elif final_dir == "SHORT" and final_conf >= CONF_THRESHOLD:
+            plan = "SHORT"
+            sl_candidates = [
+                entry + base_mult*atrval,
+                swing_hi + 0.5*atrval if not np.isnan(swing_hi) else entry + base_mult*atrval
+            ]
+            sl = max(sl_candidates)
+            R  = sl - entry
+            tp_dist = min(1.2*R, 1.5*atrval)
+            tp = entry - tp_dist
 
-    return results, plan, entry, sl, tp, atrval, has_data, confidence, regime
+    # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
+    return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(raw_conf)), int(round(final_conf))
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -382,7 +452,7 @@ def main():
     any_symbol_has_data = False
 
     for name, sym in symbols.items():
-        results, plan, entry, sl, tp, atrval, has_data, conf, regime = analyze_symbol(name, sym, daily_cache)
+        results, plan, entry, sl, tp, atrval, has_data, final_dir, raw_conf, final_conf = analyze_symbol(name, sym, daily_cache)
         if has_data:
             any_symbol_has_data = True
 
@@ -391,7 +461,8 @@ def main():
             lines.append(f"{group}: {trend}")
 
         # thêm Confidence + Regime (không ảnh hưởng logic cũ)
-        lines.append(f"Confidence: {conf}% | Regime: {regime}")
+        regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
+        lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
 
         if entry is not None and sl is not None and tp is not None:
             lines.append(
