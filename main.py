@@ -559,11 +559,12 @@ def main():
             lines.append("⚠️ Pullback: 1H ngược 4H/1D (UP) – cân nhắc chờ xác nhận")
         
         # dòng Confidence có màu & size gợi ý
-        lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime} | Size: {size_label}")
+        lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime}")
+        #| Size: {size_label}")
         
         # thêm Confidence + Regime (không ảnh hưởng logic cũ)
-        regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
-        lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
+        #regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
+        #lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
 
         if entry is not None and sl is not None and tp is not None:
             lines.append(
