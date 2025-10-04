@@ -34,7 +34,6 @@ symbols = {
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
     "EUR/USD": "EUR/USD",
-    "BTC/XAU": "BTC/XAU",
 }
 
 interval_groups = {
@@ -535,7 +534,7 @@ def analyze_symbol(name, symbol, daily_cache):
         swing_hi, swing_lo = swing_levels(df_main, 20)  # đỉnh/đáy gần
     
         # hệ số ATR theo loại sản phẩm (giữ quy ước cũ)
-        is_fx = name in ("EUR/USD", "BTC/XAU")
+        is_fx = name in ("EUR/USD")
         base_mult = 2.5 if is_fx else 1.5
     
         # ===== LONG =====
