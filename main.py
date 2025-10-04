@@ -34,6 +34,7 @@ symbols = {
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
     "EUR/USD": "EUR/USD",
+    "AUD/CAD": "AUD/CAD",
     "USD/JPY": "USD/JPY",
 }
 
@@ -368,6 +369,7 @@ def compact_label(group: str, trend: str) -> str:
         b = _extract_subdir(up, "2H")
         return f"{a}-{b}" if a != "N/A" and b != "N/A" else "MIXED"
     return "MIXED"
+    
 def detect_pullback(results: dict) -> str:
     """
     Trả về '', hoặc 'UP', 'DOWN'
@@ -393,6 +395,51 @@ def detect_pullback(results: dict) -> str:
 CONFIRM_STRONG = 70   # >=70%: mạnh
 CONFIRM_OK     = 55   # 55–69%: trung bình
 
+def smart_sl_tp(entry, atr, swing_hi, swing_lo, kup, kdn, side, is_fx):
+    """
+    Tính SL/TP:
+      - SL: ATR-based + dựa swing gần nhất (lấy xa hơn để an toàn).
+      - TP: ưu tiên 1.2R, nhưng KHÔNG vượt quá Keltner band và swing đối diện.
+    """
+    base_mult = 2.5 if is_fx else 1.5
+    buf = 0.5 * atr
+
+    if side == "LONG":
+        sl_candidates = [
+            entry - base_mult * atr,
+            (swing_lo - buf) if not np.isnan(swing_lo) else entry - base_mult * atr,
+        ]
+        sl = min(sl_candidates)
+        R = entry - sl
+
+        # trần TP bởi band/swing (nếu có)
+        caps = [1.2 * R, 1.5 * atr]
+        if not np.isnan(kup):        # khoảng tới Keltner trên
+            caps.append(max(0.0, kup - entry))
+        if not np.isnan(swing_hi):   # khoảng tới swing đỉnh
+            caps.append(max(0.0, swing_hi - entry - buf))
+
+        tp = entry + max(0.0, min(caps))
+
+    else:  # SHORT
+        sl_candidates = [
+            entry + base_mult * atr,
+            (swing_hi + buf) if not np.isnan(swing_hi) else entry + base_mult * atr,
+        ]
+        sl = max(sl_candidates)
+        R = sl - entry
+
+        caps = [1.2 * R, 1.5 * atr]
+        if not np.isnan(kdn):
+            caps.append(max(0.0, entry - kdn))
+        if not np.isnan(swing_lo):
+            caps.append(max(0.0, entry - swing_lo - buf))
+
+        tp = entry - max(0.0, min(caps))
+
+    return sl, tp
+
+
 def decide_signal_color(results: dict, final_dir: str, final_conf: int):
     """
     Trả về (emoji, label_size)
@@ -416,6 +463,7 @@ def decide_signal_color(results: dict, final_dir: str, final_conf: int):
 
     # RED – yếu/không rõ
     return "🔴", "SKIP"
+    
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -475,46 +523,64 @@ def analyze_symbol(name, symbol, daily_cache):
     final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
     save_state(state)
 
-    # ===== Entry/SL/TP từ khung CHÍNH (mặc định 2H) =====
-    MAIN_TF = os.getenv("MAIN_TF", "2h")   # "2h" hoặc "4h" hoặc "1h"
-    df_main = fetch_candles(symbol, MAIN_TF)
-    
+    # ===== Entry/SL/TP từ khung CHÍNH (mặc định 2H, có thể đổi qua biến môi trường MAIN_TF) =====
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
     
-    if df_main is not None and len(df_main) > 40:
-        bias   = strong_trend(df_main)
-        entry  = df_main["close"].iloc[-1]
-        atrval = atr(df_main, 14)
-        swing_hi, swing_lo = swing_levels(df_main, 20)
+    MAIN_TF = os.getenv("MAIN_TF", "2h")  # "2h" / "4h" / "1h" tùy bạn
+    df_main = fetch_candles(symbol, MAIN_TF)
     
-        # hệ số ATR như cũ
-        is_fx = name in ("EUR/USD", "USD/JPY")
+    if df_main is not None and len(df_main) > 60:
+        entry = float(df_main["close"].iloc[-1])
+        atrval = atr(df_main, 14)
+        swing_hi, swing_lo = swing_levels(df_main, 20)  # đỉnh/đáy gần
+    
+        # hệ số ATR theo loại sản phẩm (giữ quy ước cũ)
+        is_fx = name in ("EUR/USD", "USD/JPY", "AUD/CAD")
         base_mult = 2.5 if is_fx else 1.5
     
+        # ===== LONG =====
         if final_dir == "LONG" and final_conf >= CONF_THRESHOLD:
             plan = "LONG"
+            # SL: lấy xa hơn giữa ATR*mult và đáy gần - buffer
             sl_candidates = [
-                entry - base_mult*atrval,
-                swing_lo - 0.5*atrval if not np.isnan(swing_lo) else entry - base_mult*atrval,
+                entry - base_mult * atrval,
+                (swing_lo - 0.3 * atrval) if not np.isnan(swing_lo) else entry - base_mult * atrval
             ]
             sl = min(sl_candidates)
-            R  = entry - sl
+            R = entry - sl
     
-            # TP khuyên dùng (RR ~1.5–2.0): mở rộng hơn bản cũ
-            tp_dist = max(1.5*R, 2.0*atrval)
+            # TP “thông minh”:
+            #   - giữ RR hợp lý (1.2–1.8R)
+            #   - không vượt 3×ATR
+            #   - không chọc quá đỉnh gần + buffer
+            rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
+    
+            cap = None
+            if not np.isnan(swing_hi):
+                cap = max(0.8 * atrval, (swing_hi + 0.4 * atrval) - entry)
+            tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
             tp = entry + tp_dist
     
+        # ===== SHORT =====
         elif final_dir == "SHORT" and final_conf >= CONF_THRESHOLD:
             plan = "SHORT"
+            # SL: lấy xa hơn giữa ATR*mult và đỉnh gần + buffer
             sl_candidates = [
-                entry + base_mult*atrval,
-                swing_hi + 0.5*atrval if not np.isnan(swing_hi) else entry + base_mult*atrval,
+                entry + base_mult * atrval,
+                (swing_hi + 0.3 * atrval) if not np.isnan(swing_hi) else entry + base_mult * atrval
             ]
             sl = max(sl_candidates)
-            R  = sl - entry
-            tp_dist = max(1.5*R, 2.0*atrval)
+            R = sl - entry
+    
+            rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
+    
+            cap = None
+            if not np.isnan(swing_lo):
+                cap = max(0.8 * atrval, entry - (swing_lo - 0.4 * atrval))
+            tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
             tp = entry - tp_dist
+    # ===== Hết block SL/TP =====
 
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(raw_conf)), int(round(final_conf))
