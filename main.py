@@ -649,11 +649,13 @@ def main():
     #msg = "\n".join(lines)
     #send_telegram(msg)
     # Chỉ gửi nếu có ít nhất 1 symbol có dữ liệu thật sự
-    if any_symbol_has_data:
+    # Chỉ gửi nếu có ít nhất 1 symbol KHÔNG N/A
+    valid_lines = [l for l in lines if "N/A" not in l]
+    if len(valid_lines) > 0:
         msg = "\n".join(lines)
         send_telegram(msg)
     else:
-        print("⚠️ Tất cả đều N/A, không gửi Telegram")
+        print("❌ Tất cả đều N/A, không gửi Telegram")
 
 if __name__ == "__main__":
     main()
