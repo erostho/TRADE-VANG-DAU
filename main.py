@@ -475,41 +475,45 @@ def analyze_symbol(name, symbol, daily_cache):
     final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
     save_state(state)
 
-    # ===== Entry/SL/TP: chỉ khi đủ ngưỡng =====
+    # ===== Entry/SL/TP từ khung CHÍNH (mặc định 2H) =====
+    MAIN_TF = os.getenv("MAIN_TF", "2h")   # "2h" hoặc "4h" hoặc "1h"
+    df_main = fetch_candles(symbol, MAIN_TF)
+    
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
-
-    df1h = fetch_candles(symbol, "1h")
-    if df1h is not None and len(df1h) > 40:
-        atrval = atr(df1h, 14)
-        entry  = df1h["close"].iloc[-1]
-        swing_hi, swing_lo = swing_levels(df1h, 20)  # giữ hàm swing_levels bạn đang có
-
-        # hệ số ATR (giữ quy ước cũ của bạn)
+    
+    if df_main is not None and len(df_main) > 40:
+        bias   = strong_trend(df_main)
+        entry  = df_main["close"].iloc[-1]
+        atrval = atr(df_main, 14)
+        swing_hi, swing_lo = swing_levels(df_main, 20)
+    
+        # hệ số ATR như cũ
         is_fx = name in ("EUR/USD", "USD/JPY")
         base_mult = 2.5 if is_fx else 1.5
-
+    
         if final_dir == "LONG" and final_conf >= CONF_THRESHOLD:
             plan = "LONG"
             sl_candidates = [
                 entry - base_mult*atrval,
-                swing_lo - 0.5*atrval if not np.isnan(swing_lo) else entry - base_mult*atrval
+                swing_lo - 0.5*atrval if not np.isnan(swing_lo) else entry - base_mult*atrval,
             ]
             sl = min(sl_candidates)
             R  = entry - sl
-            # kẹp TP: nhỏ hơn giữa 1.2R và 1.5*ATR
-            tp_dist = min(1.5*R, 2.0*atrval)
+    
+            # TP khuyên dùng (RR ~1.5–2.0): mở rộng hơn bản cũ
+            tp_dist = max(1.5*R, 2.0*atrval)
             tp = entry + tp_dist
-
+    
         elif final_dir == "SHORT" and final_conf >= CONF_THRESHOLD:
             plan = "SHORT"
             sl_candidates = [
                 entry + base_mult*atrval,
-                swing_hi + 0.5*atrval if not np.isnan(swing_hi) else entry + base_mult*atrval
+                swing_hi + 0.5*atrval if not np.isnan(swing_hi) else entry + base_mult*atrval,
             ]
             sl = max(sl_candidates)
             R  = sl - entry
-            tp_dist = min(1.2*R, 1.5*atrval)
+            tp_dist = max(1.5*R, 2.0*atrval)
             tp = entry - tp_dist
 
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
