@@ -135,6 +135,7 @@ def strong_trend(df):
     e20 = ema(df["close"], 20)
     e50 = ema(df["close"], 50)
     last = df["close"].iloc[-1]
+    
     # --- FAST FLIP: 2 nến đỏ & thủng EMA20 -> SHORT ngay
     two_red  = (df['close'].iloc[-1] < df['open'].iloc[-1]) and (df['close'].iloc[-2] < df['open'].iloc[-2])
     below_e20 = df['close'].iloc[-1] < e20.iloc[-1]
