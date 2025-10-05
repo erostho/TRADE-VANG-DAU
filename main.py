@@ -43,9 +43,9 @@ interval_groups = {
 }
 # ====== STABILITY SETTINGS ======
 CONFIRM_TF = ["1h", "2h", "4h"]   # TF làm gốc cho Direction/Entry
-CONF_THRESHOLD = 60               # % tối thiểu để xuất Entry/SL/TP
-HYSTERESIS_PCT = 10               # chênh lệch % tối thiểu mới cho phép đảo chiều
-MIN_HOLD_MIN = 120                # phải giữ hướng tối thiểu 120 phút mới cho phép đảo
+CONF_THRESHOLD = 55               # % tối thiểu để xuất Entry/SL/TP
+HYSTERESIS_PCT = 6               # chênh lệch % tối thiểu mới cho phép đảo chiều
+MIN_HOLD_MIN = 90                # phải giữ hướng tối thiểu 120 phút mới cho phép đảo
 COOLDOWN_MIN = 60                 # sau khi đảo, chờ 60 phút mới được đảo nữa
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/signal_state.json")
 SMOOTH_ALPHA = 0.5                # làm mượt confidence giữa các lần chạy (0..1)
@@ -516,6 +516,31 @@ def analyze_symbol(name, symbol, daily_cache):
         raw_conf += 20
     raw_conf = max(0, min(100, raw_conf))
 
+    # ===== 2H override để phản ứng nhanh khi 2H đang giảm mạnh =====
+    df2h = fetch_candles(symbol, "2h")
+    if df2h is not None and len(df2h) >= 60:
+        e20_2h = df2h['close'].ewm(span=20, adjust=False).mean()
+        # 2 nến 2H liền kề là nến giảm
+        two_red = (df2h['close'].iloc[-1] < df2h['open'].iloc[-1]) and \
+                  (df2h['close'].iloc[-2] < df2h['open'].iloc[-2])
+        # giá dưới EMA20 và slope EMA20 đang âm
+        below_e20 = df2h['close'].iloc[-1] < e20_2h.iloc[-1]
+        slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
+    
+        if two_red and below_e20 and slope_neg:
+            raw_conf = max(0, raw_conf - 25)
+            print(f"⚠️ 2H đảo chiều giảm mạnh – hạ confidence {symbol} xuống {raw_conf}")
+            # Nếu khung lớn vẫn LONG -> hạ xuống SIDEWAY & kẹp conf
+            hi_bias = results.get("4H", "N/A")
+            d1_bias = results.get("1D", "N/A")
+            if raw_dir == "LONG" and ("LONG" in (hi_bias, d1_bias)):
+                raw_dir  = "SIDEWAY"
+                raw_conf = min(raw_conf, 50)
+            # Nếu khung lớn không ủng hộ LONG -> cho phép lật SHORT nhạy hơn
+            else:
+                raw_dir  = "SHORT"
+                raw_conf = max(raw_conf, 65)
+    
     # Áp dụng hysteresis & memory
     state = load_state()
     final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
