@@ -732,6 +732,18 @@ def main():
 
     for name, sym in symbols.items():
         results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf = analyze_symbol(name, sym, daily_cache)
+        # Cảnh báo fast-flip 2H nếu có
+        df_2h_check = fetch_candles(sym, "2h")
+        fast_flip = False
+        if df_2h_check is not None and len(df_2h_check) > 60:
+            e20_2h = df_2h_check["close"].ewm(span=20, adjust=False).mean()
+            two_red = (df_2h_check["close"].iloc[-1] < df_2h_check["open"].iloc[-1]) and (df_2h_check["close"].iloc[-2] < df_2h_check["open"].iloc[-2])
+            below_e20 = df_2h_check["close"].iloc[-1] < e20_2h.iloc[-1]
+            slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
+            if two_red and below_e20 and slope_neg:
+                fast_flip = True
+        if fast_flip:
+            lines.append("⚡ Fast-flip 2H active — chờ nến đóng xác nhận")
         if has_data:
             any_symbol_has_data = True
 
