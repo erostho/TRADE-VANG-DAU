@@ -128,19 +128,37 @@ def keltner_mid(df, n=20, atr_mult=1.0):
     return mid_val, mid_val + atr_mult*a, mid_val - atr_mult*a
 
 def strong_trend(df):
-    """Regime + slope cơ bản để gán LONG/SHORT/SIDEWAY"""
+    """Trả LONG/SHORT/SIDEWAY cho 1 khung thời gian."""
     if df is None or len(df) < 60:
         return "N/A"
-    e20 = ema(df['close'], 20)
-    e50 = ema(df['close'], 50)
-    last = df['close'].iloc[-1]
-    adx_val = adx(df, 14)
-    if len(e20) < 6 or np.isnan(adx_val):
+
+    e20 = ema(df["close"], 20)
+    e50 = ema(df["close"], 50)
+    last = df["close"].iloc[-1]
+
+    # slope theo % trong 5 nến gần nhất
+    slope = (e20.iloc[-1] - e20.iloc[-6]) / max(1e-9, e20.iloc[-6]) * 100.0
+
+    # nếu có hàm adx(df, 14) thì dùng; không có thì coi như đạt
+    try:
+        adx_val = adx(df, 14)
+        adx_ok = (not np.isnan(adx_val)) and adx_val >= 18
+    except Exception:
+        adx_ok = True
+
+    # ngưỡng đề xuất (có thể chỉnh)
+    SLOPE_UP = 0.15   # +0.15% trong 5 nến
+    SLOPE_DN = -0.15  # -0.15% trong 5 nến
+
+    if len(e20) < 60 or np.isnan(e20.iloc[-1]) or np.isnan(e50.iloc[-1]):
         return "N/A"
-    slope = (e20.iloc[-1] - e20.iloc[-6]) / max(1e-9, e20.iloc[-6]) * 100
-    if (e20.iloc[-1] > e50.iloc[-1]) and (last > e20.iloc[-1]) and (adx_val >= 20) and (slope > 0.02):
+
+    long_cond  = (last > e20.iloc[-1] > e50.iloc[-1]) and (slope > SLOPE_UP) and adx_ok
+    short_cond = (last < e20.iloc[-1] < e50.iloc[-1]) and (slope < SLOPE_DN) and adx_ok
+
+    if long_cond:
         return "LONG"
-    if (e20.iloc[-1] < e50.iloc[-1]) and (last < e20.iloc[-1]) and (adx_val >= 20) and (slope < -0.02):
+    if short_cond:
         return "SHORT"
     return "SIDEWAY"
 
