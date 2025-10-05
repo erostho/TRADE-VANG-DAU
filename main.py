@@ -731,8 +731,7 @@ def main():
             slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
             if two_red and below_e20 and slope_neg:
                 fast_flip = True
-        if fast_flip:
-            lines.append("⚡ Fast-flip 2H active — chờ nến kế tiếp")
+
         if has_data:
             any_symbol_has_data = True
 
@@ -752,8 +751,9 @@ def main():
         
         # dòng Confidence có màu & size gợi ý
         lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime}")
+        if fast_flip:
+            lines.append(f"⚡ Fast-flip 2H active — chờ nến kế tiếp")        
         #| Size: {size_label}")
-        
         # thêm Confidence + Regime (không ảnh hưởng logic cũ)
         #regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
         #lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
