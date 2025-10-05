@@ -27,7 +27,26 @@ RPM = int(os.getenv("RPM", 7))
 
 # Cache 1D (chỉ fetch 1 lần/ngày lúc 00:05)
 DAILY_CACHE_PATH = os.getenv("DAILY_CACHE_PATH", "/tmp/daily_cache.json")
+from collections import deque
 
+# cache cho 1 lần chạy
+RUN_CACHE = {}
+
+# token bucket đơn giản cho quota theo phút
+_last_min_calls = deque()   # lưu timestamps các call trong 60s gần nhất
+def _throttle():
+    # số call/phút cho phép
+    limit = max(1, int(os.getenv("RPM", 7)))
+    now = time.monotonic()
+    # bỏ timestamps cũ hơn 60s
+    while _last_min_calls and now - _last_min_calls[0] > 60:
+        _last_min_calls.popleft()
+    if len(_last_min_calls) >= limit:
+        # đợi tới khi đủ chỗ
+        sleep_for = 60 - (now - _last_min_calls[0]) + 0.01
+        time.sleep(max(0.0, sleep_for))
+    _last_min_calls.append(time.monotonic())
+    
 symbols = {
     "Bitcoin": "BTC/USD",
     "Ethereum": "ETH/USD",
@@ -51,12 +70,17 @@ STATE_PATH = os.getenv("STATE_PATH", "/tmp/signal_state.json")
 SMOOTH_ALPHA = 0.5                # làm mượt confidence giữa các lần chạy (0..1)
 # ================ HELPERS ================
 def fetch_candles(symbol, interval, retries=3):
+    key = (symbol, interval)
+    if key in RUN_CACHE:
+        return RUN_CACHE[key]
+
     url = f"{BASE_URL}?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize=200"
     for attempt in range(retries):
         try:
+            _throttle()  # GIỮA MỌI LẦN GỌI
             r = requests.get(url, timeout=10)
             if r.status_code == 429:
-                logging.warning(f"Rate limit hit for {symbol}-{interval}, sleeping 65s then retry...")
+                logging.warning(f"429 {symbol}-{interval} -> sleep 65s & retry...")
                 time.sleep(65)
                 continue
             data = r.json()
@@ -68,6 +92,7 @@ def fetch_candles(symbol, interval, retries=3):
             df = df.sort_values("datetime").reset_index(drop=True)
             for col in ["open", "high", "low", "close"]:
                 df[col] = pd.to_numeric(df[col])
+            RUN_CACHE[key] = df  # lưu cache cho cùng lần chạy
             return df
         except Exception as e:
             logging.error(f"Fetch error {symbol}-{interval}: {e}")
@@ -529,7 +554,7 @@ def analyze_symbol(name, symbol, daily_cache):
             df = fetch_candles(symbol, iv)
             trend = strong_trend(df)
             trends.append(f"{iv}:{trend}")
-            time.sleep(60.0 / RPM)
+            #time.sleep(60.0 / RPM)
         if len(intervals) == 1:
             res = trends[0].split(":")[1]
         else:
@@ -570,6 +595,7 @@ def analyze_symbol(name, symbol, daily_cache):
     if d1 == raw_dir:
         raw_conf += 20
     raw_conf = max(0, min(100, raw_conf))
+    
     # Nếu có fast_bear mà memory vẫn giữ conf cao, ép kẹp xuống mức vừa tính
     fast_bear = detect_fast_flip_2h(symbol)
     if fast_bear:
@@ -582,43 +608,6 @@ def analyze_symbol(name, symbol, daily_cache):
         else:
             raw_dir  = "SHORT"
             raw_conf = min(raw_conf, 35)
-    # ===== 2H override để phản ứng nhanh khi 2H đang giảm mạnh =====
-    df2h = fetch_candles(symbol, "2h")
-    if df2h is not None and len(df2h) >= 60:
-        e20_2h = df2h['close'].ewm(span=20, adjust=False).mean()
-        # 2 nến 2H liền kề là nến giảm
-        two_red = (df2h['close'].iloc[-1] < df2h['open'].iloc[-1]) and \
-                  (df2h['close'].iloc[-2] < df2h['open'].iloc[-2])
-        # giá dưới EMA20 và slope EMA20 đang âm
-        below_e20 = df2h['close'].iloc[-1] < e20_2h.iloc[-1]
-        slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
-    
-        if two_red and below_e20 and slope_neg:
-            raw_conf = max(0, raw_conf - 25)
-            print(f"⚠️ 2H đảo chiều giảm mạnh – hạ confidence {symbol} xuống {raw_conf}")
-            # --- 2H override để phản ứng nhanh khi 2H giảm mạnh ---
-
-            df2h = fetch_candles(symbol, "2h")
-            if df2h is not None and len(df2h) > 60:
-                e20_2h = df2h['close'].ewm(span=20, adjust=False).mean()
-                two_red = (df2h['close'].iloc[-1] < df2h['open'].iloc[-1]) and \
-                          (df2h['close'].iloc[-2] < df2h['open'].iloc[-2])
-                below_e20 = df2h['close'].iloc[-1] < e20_2h.iloc[-1]
-                slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
-            
-                if two_red and below_e20 and slope_neg:
-                    # nếu 4H/1D vẫn LONG thì hạ về SIDEWAY, còn không thì cho SHORT nhẹ
-                    hi_bias  = results.get("4H", "N/A")
-                    d1_bias  = results.get("1D", "N/A")
-            
-                    if raw_dir == "LONG" and ("LONG" in (hi_bias, d1_bias)):
-                        raw_dir  = "SIDEWAY"
-                        raw_conf = min(raw_conf, 50)
-                    else:
-                        raw_dir  = "SHORT"
-                        raw_conf = min(raw_conf, 35)
-                    fast_bear = True
-                    print(f"⚠️ 2H đảo chiều mạnh -> raw_dir={raw_dir}, raw_conf={raw_conf}")
             
             # Nếu khung lớn vẫn LONG -> hạ xuống SIDEWAY & kẹp conf
             hi_bias = results.get("4H", "N/A")
@@ -743,7 +732,7 @@ def main():
             if two_red and below_e20 and slope_neg:
                 fast_flip = True
         if fast_flip:
-            lines.append("⚡ Fast-flip 2H active — chờ nến đóng xác nhận")
+            lines.append("⚡ Fast-flip 2H active — chờ nến kế tiếp")
         if has_data:
             any_symbol_has_data = True
 
