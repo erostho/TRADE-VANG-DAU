@@ -129,12 +129,11 @@ def keltner_mid(df, n=20, atr_mult=1.0):
 
 def strong_trend(df):
     """Trả LONG/SHORT/SIDEWAY cho 1 khung thời gian."""
-    if df is None or len(df) < 60:
+    if df is None or len(df) < 65:
         return "N/A"
-
     e20 = ema(df["close"], 20)
     e50 = ema(df["close"], 50)
-    last = df["close"].iloc[-1]
+    last = df["close"].iloc[-2]
     
     # --- FAST FLIP: 2 nến đỏ & thủng EMA20 -> SHORT ngay
     two_red  = (df['close'].iloc[-1] < df['open'].iloc[-1]) and (df['close'].iloc[-2] < df['open'].iloc[-2])
@@ -148,7 +147,7 @@ def strong_trend(df):
     if two_green and above_e20:
         return "LONG"
     # slope theo % trong 5 nến gần nhất
-    slope = (e20.iloc[-1] - e20.iloc[-6]) / max(1e-9, e20.iloc[-6]) * 100.0
+    slope = (e20.iloc[-2] - e20.iloc[-5]) / max(1e-9, e20.iloc[-5]) * 100.0
 
     # nếu có hàm adx(df, 14) thì dùng; không có thì coi như đạt
     try:
@@ -161,11 +160,11 @@ def strong_trend(df):
     SLOPE_UP = 0.15   # +0.15% trong 5 nến
     SLOPE_DN = -0.15  # -0.15% trong 5 nến
 
-    if len(e20) < 60 or np.isnan(e20.iloc[-1]) or np.isnan(e50.iloc[-1]):
+    if len(e20) < 60 or np.isnan(e20.iloc[-2]) or np.isnan(e50.iloc[-2]):
         return "N/A"
 
-    long_cond  = (last > e20.iloc[-1] > e50.iloc[-1]) and (slope > SLOPE_UP) and adx_ok
-    short_cond = (last < e20.iloc[-1] < e50.iloc[-1]) and (slope < SLOPE_DN) and adx_ok
+    long_cond  = (last > e20.iloc[-2] > e50.iloc[-1]) and (slope > SLOPE_UP) and adx_ok
+    short_cond = (last < e20.iloc[-2] < e50.iloc[-1]) and (slope < SLOPE_DN) and adx_ok
 
     if long_cond:
         return "LONG"
@@ -615,7 +614,7 @@ def analyze_symbol(name, symbol, daily_cache):
     df_main = fetch_candles(symbol, MAIN_TF)
     
     if df_main is not None and len(df_main) > 60:
-        entry = float(df_main["close"].iloc[-1])
+        entry = float(df_main["close"].iloc[-2])
         atrval = atr(df_main, 14)
         swing_hi, swing_lo = swing_levels(df_main, 20)  # đỉnh/đáy gần
     
