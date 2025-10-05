@@ -466,6 +466,7 @@ def decide_signal_color(results: dict, final_dir: str, final_conf: int):
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
     has_data = False
+    fast_bear = False
 
     # 1) Trend text theo nhóm khung như cũ (dùng strong_trend)
     for group, intervals in interval_groups.items():
@@ -531,7 +532,7 @@ def analyze_symbol(name, symbol, daily_cache):
             raw_conf = max(0, raw_conf - 25)
             print(f"⚠️ 2H đảo chiều giảm mạnh – hạ confidence {symbol} xuống {raw_conf}")
             # --- 2H override để phản ứng nhanh khi 2H giảm mạnh ---
-            fast_bear = False
+
             df2h = fetch_candles(symbol, "2h")
             if df2h is not None and len(df2h) > 60:
                 e20_2h = df2h['close'].ewm(span=20, adjust=False).mean()
