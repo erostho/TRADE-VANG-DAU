@@ -128,50 +128,76 @@ def keltner_mid(df, n=20, atr_mult=1.0):
     return mid_val, mid_val + atr_mult*a, mid_val - atr_mult*a
 
 def strong_trend(df):
-    """Trả LONG/SHORT/SIDEWAY cho 1 khung thời gian."""
+    """Trả LONG/SHORT/SIDEWAY cho 1 khung thời gian (dùng nến đã ĐÓNG)."""
     if df is None or len(df) < 65:
         return "N/A"
+
     e20 = ema(df["close"], 20)
     e50 = ema(df["close"], 50)
-    last = df["close"].iloc[-2]
-    
-    # --- FAST FLIP: 2 nến đỏ & thủng EMA20 -> SHORT ngay
-    two_red  = (df['close'].iloc[-1] < df['open'].iloc[-1]) and (df['close'].iloc[-2] < df['open'].iloc[-2])
-    below_e20 = df['close'].iloc[-1] < e20.iloc[-1]
-    if two_red and below_e20:
-        return "SHORT"
-    
-    # (tương tự cho chiều tăng nếu bạn muốn)
-    two_green = (df['close'].iloc[-1] > df['open'].iloc[-1]) and (df['close'].iloc[-2] > df['open'].iloc[-2])
-    above_e20 = df['close'].iloc[-1] > e20.iloc[-1]
-    if two_green and above_e20:
-        return "LONG"
-    # slope theo % trong 5 nến gần nhất
-    slope = (e20.iloc[-2] - e20.iloc[-5]) / max(1e-9, e20.iloc[-5]) * 100.0
+    if len(e20) < 60 or np.isnan(e20.iloc[-2]) or np.isnan(e50.iloc[-2]):
+        return "N/A"
 
-    # nếu có hàm adx(df, 14) thì dùng; không có thì coi như đạt
+    last = float(df["close"].iloc[-2])
+    # dốc EMA20 ~5 nến (đều là closed bar)
+    slope = (e20.iloc[-2] - e20.iloc[-7]) / max(1e-9, e20.iloc[-7]) * 100.0
+
+    # ADX (không có thì coi như pass)
     try:
         adx_val = adx(df, 14)
         adx_ok = (not np.isnan(adx_val)) and adx_val >= 18
     except Exception:
         adx_ok = True
 
-    # ngưỡng đề xuất (có thể chỉnh)
-    SLOPE_UP = 0.15   # +0.15% trong 5 nến
-    SLOPE_DN = -0.15  # -0.15% trong 5 nến
+    SLOPE_UP = 0.15
+    SLOPE_DN = -0.15
 
+    long_cond  = (last > e20.iloc[-2] > e50.iloc[-2]) and (slope > SLOPE_UP) and adx_ok
+    short_cond = (last < e20.iloc[-2] < e50.iloc[-2]) and (slope < SLOPE_DN) and adx_ok
+
+    if long_cond:  return "LONG"
+    if short_cond: return "SHORT"
+    return "SIDEWAY"
+def strong_trend(df):
+    """Trả LONG/SHORT/SIDEWAY cho 1 khung thời gian (dùng nến đã ĐÓNG)."""
+    if df is None or len(df) < 65:
+        return "N/A"
+
+    e20 = ema(df["close"], 20)
+    e50 = ema(df["close"], 50)
     if len(e20) < 60 or np.isnan(e20.iloc[-2]) or np.isnan(e50.iloc[-2]):
         return "N/A"
 
-    long_cond  = (last > e20.iloc[-2] > e50.iloc[-1]) and (slope > SLOPE_UP) and adx_ok
-    short_cond = (last < e20.iloc[-2] < e50.iloc[-1]) and (slope < SLOPE_DN) and adx_ok
+    last = float(df["close"].iloc[-2])
+    # dốc EMA20 ~5 nến (đều là closed bar)
+    slope = (e20.iloc[-2] - e20.iloc[-7]) / max(1e-9, e20.iloc[-7]) * 100.0
 
-    if long_cond:
-        return "LONG"
-    if short_cond:
-        return "SHORT"
+    # ADX (không có thì coi như pass)
+    try:
+        adx_val = adx(df, 14)
+        adx_ok = (not np.isnan(adx_val)) and adx_val >= 18
+    except Exception:
+        adx_ok = True
+
+    SLOPE_UP = 0.15
+    SLOPE_DN = -0.15
+
+    long_cond  = (last > e20.iloc[-2] > e50.iloc[-2]) and (slope > SLOPE_UP) and adx_ok
+    short_cond = (last < e20.iloc[-2] < e50.iloc[-2]) and (slope < SLOPE_DN) and adx_ok
+
+    if long_cond:  return "LONG"
+    if short_cond: return "SHORT"
     return "SIDEWAY"
-
+    
+def detect_fast_flip_2h(symbol):
+    df2h = fetch_candles(symbol, "2h")
+    if df2h is None or len(df2h) < 60:
+        return False
+    e20 = df2h['close'].ewm(span=20, adjust=False).mean()
+    two_red  = (df2h['close'].iloc[-1] < df2h['open'].iloc[-1]) and (df2h['close'].iloc[-2] < df2h['open'].iloc[-2])
+    below_e20 = df2h['close'].iloc[-1] < e20.iloc[-1]
+    slope_neg = (e20.iloc[-1] - e20.iloc[-6]) < 0
+    return bool(two_red and below_e20 and slope_neg)
+    
 def swing_levels(df, lookback=20):
     if df is None or len(df) < lookback + 2:
         return (np.nan, np.nan)
@@ -544,7 +570,18 @@ def analyze_symbol(name, symbol, daily_cache):
     if d1 == raw_dir:
         raw_conf += 20
     raw_conf = max(0, min(100, raw_conf))
-
+    # Nếu có fast_bear mà memory vẫn giữ conf cao, ép kẹp xuống mức vừa tính
+    fast_bear = detect_fast_flip_2h(symbol)
+    if fast_bear:
+        raw_conf = max(0, raw_conf - 25)
+        hi_bias = results.get("4H", "N/A")
+        d1_bias = results.get("1D", "N/A")
+        if raw_dir == "LONG" and ("LONG" in (hi_bias, d1_bias)):
+            raw_dir  = "SIDEWAY"
+            raw_conf = min(raw_conf, 50)
+        else:
+            raw_dir  = "SHORT"
+            raw_conf = min(raw_conf, 35)
     # ===== 2H override để phản ứng nhanh khi 2H đang giảm mạnh =====
     df2h = fetch_candles(symbol, "2h")
     if df2h is not None and len(df2h) >= 60:
@@ -597,6 +634,7 @@ def analyze_symbol(name, symbol, daily_cache):
     # Áp dụng hysteresis & memory
     state = load_state()
     final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
+    
     # Nếu có fast_bear mà memory vẫn giữ conf cao, thì ép kẹp xuống mức vừa tính
     if fast_bear and final_conf > raw_conf:
         final_conf = raw_conf
