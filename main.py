@@ -530,6 +530,30 @@ def analyze_symbol(name, symbol, daily_cache):
         if two_red and below_e20 and slope_neg:
             raw_conf = max(0, raw_conf - 25)
             print(f"⚠️ 2H đảo chiều giảm mạnh – hạ confidence {symbol} xuống {raw_conf}")
+            # --- 2H override để phản ứng nhanh khi 2H giảm mạnh ---
+            fast_bear = False
+            df2h = fetch_candles(symbol, "2h")
+            if df2h is not None and len(df2h) > 60:
+                e20_2h = df2h['close'].ewm(span=20, adjust=False).mean()
+                two_red = (df2h['close'].iloc[-1] < df2h['open'].iloc[-1]) and \
+                          (df2h['close'].iloc[-2] < df2h['open'].iloc[-2])
+                below_e20 = df2h['close'].iloc[-1] < e20_2h.iloc[-1]
+                slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
+            
+                if two_red and below_e20 and slope_neg:
+                    # nếu 4H/1D vẫn LONG thì hạ về SIDEWAY, còn không thì cho SHORT nhẹ
+                    hi_bias  = results.get("4H", "N/A")
+                    d1_bias  = results.get("1D", "N/A")
+            
+                    if raw_dir == "LONG" and ("LONG" in (hi_bias, d1_bias)):
+                        raw_dir  = "SIDEWAY"
+                        raw_conf = min(raw_conf, 50)
+                    else:
+                        raw_dir  = "SHORT"
+                        raw_conf = min(raw_conf, 35)
+                    fast_bear = True
+                    print(f"⚠️ 2H đảo chiều mạnh -> raw_dir={raw_dir}, raw_conf={raw_conf}")
+            
             # Nếu khung lớn vẫn LONG -> hạ xuống SIDEWAY & kẹp conf
             hi_bias = results.get("4H", "N/A")
             d1_bias = results.get("1D", "N/A")
@@ -544,6 +568,13 @@ def analyze_symbol(name, symbol, daily_cache):
     # Áp dụng hysteresis & memory
     state = load_state()
     final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
+    # Nếu có fast_bear mà memory vẫn giữ conf cao, thì ép kẹp xuống mức vừa tính
+    if fast_bear and final_conf > raw_conf:
+        final_conf = raw_conf
+        # cập nhật luôn vào state để lần sau không bật lại 86%
+        state.setdefault(symbol, {})
+        state[symbol]["dir"]  = final_dir
+        state[symbol]["conf"] = final_conf
     save_state(state)
 
     # ===== Entry/SL/TP từ khung CHÍNH (mặc định 2H, có thể đổi qua biến môi trường MAIN_TF) =====
@@ -606,7 +637,7 @@ def analyze_symbol(name, symbol, daily_cache):
     # ===== Hết block SL/TP =====
 
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
-    return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(raw_conf)), int(round(final_conf))
+    return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf))
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -633,7 +664,7 @@ def main():
     any_symbol_has_data = False
 
     for name, sym in symbols.items():
-        results, plan, entry, sl, tp, atrval, has_data, final_dir, raw_conf, final_conf = analyze_symbol(name, sym, daily_cache)
+        results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf = analyze_symbol(name, sym, daily_cache)
         if has_data:
             any_symbol_has_data = True
 
