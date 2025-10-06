@@ -474,29 +474,25 @@ CONFIRM_STRONG = 70   # >=70%: mạnh
 CONFIRM_OK     = 55   # 55–69%: trung bình
 
 def smart_sl_tp(entry, atr, swing_hi, swing_lo, kup, kdn, side, is_fx):
-    """
-    Tính SL/TP:
-      - SL: ATR-based + dựa swing gần nhất (lấy xa hơn để an toàn).
-      - TP: ưu tiên 1.2R, nhưng KHÔNG vượt quá Keltner band và swing đối diện.
-    """
-    base_mult = 2.5 if is_fx else 1.5
-    buf = 0.5 * atr
+    # nhẹ tay hơn
+    base_mult = 2.0 if is_fx else 1.2      # (trước: 2.5 / 1.5)
+    buf = 0.3 * atr                         # (trước: 0.5 * ATR)
 
     if side == "LONG":
+        # chọn SL gần hơn, nhưng không chặt hơn 0.8*ATR
         sl_candidates = [
             entry - base_mult * atr,
             (swing_lo - buf) if not np.isnan(swing_lo) else entry - base_mult * atr,
         ]
-        sl = min(sl_candidates)
+        sl = max(sl_candidates)             # GẦN HƠN cho LONG
+        sl = min(sl, entry - 0.8 * atr)     # vẫn cách tối thiểu 0.8*ATR
+
         R = entry - sl
 
-        # trần TP bởi band/swing (nếu có)
+        # TP “thông minh” giữ nguyên
         caps = [1.2 * R, 1.5 * atr]
-        if not np.isnan(kup):        # khoảng tới Keltner trên
-            caps.append(max(0.0, kup - entry))
-        if not np.isnan(swing_hi):   # khoảng tới swing đỉnh
-            caps.append(max(0.0, swing_hi - entry - buf))
-
+        if not np.isnan(kup):  caps.append(max(0.0, kup - entry))
+        if not np.isnan(swing_hi): caps.append(max(0.0, swing_hi - entry - buf))
         tp = entry + max(0.0, min(caps))
 
     else:  # SHORT
@@ -504,15 +500,14 @@ def smart_sl_tp(entry, atr, swing_hi, swing_lo, kup, kdn, side, is_fx):
             entry + base_mult * atr,
             (swing_hi + buf) if not np.isnan(swing_hi) else entry + base_mult * atr,
         ]
-        sl = max(sl_candidates)
+        sl = min(sl_candidates)             # GẦN HƠN cho SHORT
+        sl = max(sl, entry + 0.8 * atr)     # vẫn cách tối thiểu 0.8*ATR
+
         R = sl - entry
 
         caps = [1.2 * R, 1.5 * atr]
-        if not np.isnan(kdn):
-            caps.append(max(0.0, entry - kdn))
-        if not np.isnan(swing_lo):
-            caps.append(max(0.0, entry - swing_lo - buf))
-
+        if not np.isnan(kdn):      caps.append(max(0.0, entry - kdn))
+        if not np.isnan(swing_lo): caps.append(max(0.0, entry - swing_lo - buf))
         tp = entry - max(0.0, min(caps))
 
     return sl, tp
