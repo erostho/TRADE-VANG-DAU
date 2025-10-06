@@ -70,71 +70,34 @@ COOLDOWN_MIN = 60                 # sau khi đảo, chờ 60 phút mới đượ
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/signal_state.json")
 SMOOTH_ALPHA = 0.5                # làm mượt confidence giữa các lần chạy (0..1)
 # ================ HELPERS ================
-def fetch_candles(symbol, interval, retries=4, timeout=12, session=None):
-    """
-    Gọi TwelveData an toàn hơn:
-    - Retry & exponential backoff (2s, 4s, 6s, 8s)
-    - Bắt 429 -> chờ Retry-After (mặc định 60s) rồi thử lại
-    - Kiểm tra response rỗng / không phải JSON
-    - Làm sạch dữ liệu NaN
-    """
-    s = session or requests.Session()
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "apikey": API_KEY,
-        "outputsize": 200,
-    }
+def fetch_candles(symbol, interval, retries=3):
+    key = (symbol, interval)
+    if key in RUN_CACHE:
+        return RUN_CACHE[key]
 
+    url = f"{BASE_URL}?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize=200"
     for attempt in range(retries):
         try:
-            r = s.get(BASE_URL, params=params, timeout=timeout)
-
-            # Hết hạn mức trong phút hiện tại
+            _throttle()  # GIỮA MỌI LẦN GỌI
+            r = requests.get(url, timeout=10)
             if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", "60"))
-                wait = max(wait, 60)
-                logging.warning(f"Rate limit 429 for {symbol}-{interval} — sleep {wait}s then retry...")
-                time.sleep(wait)
+                logging.warning(f"429 {symbol}-{interval} -> sleep 65s & retry...")
+                time.sleep(65)
                 continue
-
-            r.raise_for_status()
-
-            txt = r.text.strip()
-            if not txt or not txt.startswith("{"):
-                raise ValueError("Empty / non-JSON response")
-
             data = r.json()
-            vals = data.get("values")
-            if not vals:
-                logging.warning(f"No data payload for {symbol}-{interval}: {data}")
-                # thử lại sau một nhịp ngắn
-                time.sleep(3 + 2*attempt)
-                continue
-
-            df = pd.DataFrame(vals)
-            df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+            if "values" not in data:
+                logging.warning(f"No data for {symbol}-{interval}: {data}")
+                return None
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
             df = df.sort_values("datetime").reset_index(drop=True)
-
-            for col in ("open", "high", "low", "close"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-            df = df.dropna(subset=["open", "high", "low", "close"])
-            if df.empty:
-                raise ValueError("Empty after cleaning")
-
+            for col in ["open", "high", "low", "close"]:
+                df[col] = pd.to_numeric(df[col])
+            RUN_CACHE[key] = df  # lưu cache cho cùng lần chạy
             return df
-
-        except (requests.Timeout, requests.ConnectionError) as e:
-            logging.error(f"Fetch timeout/conn {symbol}-{interval}: {e}")
         except Exception as e:
             logging.error(f"Fetch error {symbol}-{interval}: {e}")
-
-        # exponential backoff
-        backoff = 2 * (attempt + 1)
-        time.sleep(backoff)
-
-    logging.error(f"Give up fetching {symbol}-{interval} after {retries} attempts.")
+            time.sleep(3)
     return None
 
 def atr(df, period=14):
