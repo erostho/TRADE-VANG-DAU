@@ -52,6 +52,7 @@ symbols = {
     "Ethereum": "ETH/USD",
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
+    "USD/JPY": "USD/JPY",
     "EUR/USD": "EUR/USD",
 }
 
@@ -295,7 +296,7 @@ def format_price(sym, val):
     # FX thì 2 chữ số thập phân với JPY, 5 với EURUSD; hàng hóa/crypto để 2
     if "JPY" in sym:
         return f"{val:.2f}"
-    if sym in ("EUR/USD",):
+    if sym in ("EUR/USD","USD/JPY"):
         return f"{val:.5f}"
     return f"{val:.2f}"
 
@@ -646,7 +647,7 @@ def analyze_symbol(name, symbol, daily_cache):
         swing_hi, swing_lo = swing_levels(df_main, 20)  # đỉnh/đáy gần
     
         # hệ số ATR theo loại sản phẩm (giữ quy ước cũ)
-        is_fx = name in ("EUR/USD")
+        is_fx = name in ("EUR/USD", "USD/JPY")
         base_mult = 2.5 if is_fx else 1.5
     
         # ===== LONG =====
