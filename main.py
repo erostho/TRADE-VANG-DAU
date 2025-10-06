@@ -430,22 +430,36 @@ def _extract_subdir(mixed_text: str, key: str) -> str:
     m = re.search(fr"{key}\s*:\s*(LONG|SHORT|SIDEWAY)", mixed_text, re.IGNORECASE)
     return m.group(1).upper() if m else "N/A"
     
+import re
+
 def compact_label(group: str, trend: str) -> str:
-    """Rút gọn Mixed(...) thành 'A-B' theo cặp khung; còn lại giữ nguyên."""
+    """Rút gọn/ghi rõ Mixed của cặp khung; các trường hợp khác giữ nguyên."""
     if not isinstance(trend, str):
         return "N/A"
-    if not trend.upper().startswith("MIXED"):
-        return trend
 
     up = trend.upper()
-    if group == "15m-30m":
-        a = _extract_subdir(up, "15MIN")
-        b = _extract_subdir(up, "30MIN")
-        return f"{a}-{b}" if a != "N/A" and b != "N/A" else "MIXED"
+    if not up.startswith("MIXED"):
+        return trend  # đã là LONG/SHORT/SIDEWAY thì trả nguyên
+
+    # lấy hướng của 1 khung từ chuỗi Mixed (case-insensitive)
+    def pick(key: str) -> str:
+        m = re.search(rf"{key}\s*:\s*(LONG|SHORT|SIDEWAY)", up, re.IGNORECASE)
+        return m.group(1).upper() if m else "N/A"
+
     if group == "1H-2H":
-        a = _extract_subdir(up, "1H")
-        b = _extract_subdir(up, "2H")
-        return f"{a}-{b}" if a != "N/A" and b != "N/A" else "MIXED"
+        d1h = pick("1H")
+        d2h = pick("2H")
+        if d1h != "N/A" and d2h != "N/A":
+            return d1h if d1h == d2h else f"MIXED ({d1h} – {d2h})"
+        return "MIXED"
+
+    if group == "15m-30m":
+        d15 = pick("15MIN")
+        d30 = pick("30MIN")
+        if d15 != "N/A" and d30 != "N/A":
+            return d15 if d15 == d30 else f"MIXED ({d15} – {d30})"
+        return "MIXED"
+
     return "MIXED"
     
 def detect_pullback(results: dict) -> str:
