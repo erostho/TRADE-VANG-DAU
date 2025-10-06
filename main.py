@@ -50,6 +50,7 @@ def _throttle():
 symbols = {
     "Bitcoin": "BTC/USD",
     "Ethereum": "ETH/USD",
+    "BTC/XAU": "BTC/XAU",
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
     "EUR/USD": "EUR/USD",
