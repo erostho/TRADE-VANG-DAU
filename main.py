@@ -300,6 +300,122 @@ def format_price(sym, val):
         return f"{val:.5f}"
     return f"{val:.2f}"
 
+# ================= EXTRA HELPERS (ADD) =================
+def bb_width(df, n=20):
+    """Bollinger Band Width = (upper - lower) / middle (tỷ lệ, vd 0.02 = 2%)"""
+    if df is None or len(df) < n + 2:
+        return np.nan
+    m = df['close'].rolling(n).mean()
+    s = df['close'].rolling(n).std()
+    upper = m + 2*s
+    lower = m - 2*s
+    mid = m
+    bw = (upper.iloc[-2] - lower.iloc[-2]) / max(1e-9, mid.iloc[-2])
+    return float(bw)
+
+def is_fx(sym_name_or_symbol: str) -> bool:
+    up = sym_name_or_symbol.upper()
+    return ("EUR/USD" in up) or ("USD/JPY" in up) or ("/" in up and "XAU" not in up and "BTC" not in up and "ETH" not in up)
+
+def is_crypto(sym_name_or_symbol: str) -> bool:
+    up = sym_name_or_symbol.upper()
+    return ("BTC" in up) or ("ETH" in up)
+
+def is_commodity(sym_name_or_symbol: str) -> bool:
+    up = sym_name_or_symbol.upper()
+    return ("XAU" in up) or ("GOLD" in up) or ("CL" in up) or ("OIL" in up)
+
+# ——— Chuẩn hoá TF score theo confluence chỉ báo (0..1)
+def calc_tf_score(df, direction: str) -> float:
+    if df is None or len(df) < 60 or direction not in ("LONG","SHORT"):
+        return 0.0
+    try:
+        e20 = ema(df["close"], 20)
+        e50 = ema(df["close"], 50)
+        a14 = adx(df, 14)
+        mh  = macd_hist(df["close"])
+        r14 = rsi(df["close"], 14).iloc[-2]
+        last = df["close"].iloc[-2]
+    except Exception:
+        return 0.0
+
+    score = 0.0
+    # ADX: trend strength
+    if not np.isnan(a14) and a14 >= 20: 
+        score += 0.25
+    # EMA alignment
+    if direction == "LONG"  and e20.iloc[-2] > e50.iloc[-2]: score += 0.25
+    if direction == "SHORT" and e20.iloc[-2] < e50.iloc[-2]: score += 0.25
+    # MACD hist
+    if (direction == "LONG" and mh > 0) or (direction == "SHORT" and mh < 0):
+        score += 0.25
+    # RSI vùng thuận
+    if (direction == "LONG" and r14 >= 50) or (direction == "SHORT" and r14 <= 50):
+        score += 0.25
+
+    return float(min(score, 1.0))
+
+def weighted_confidence(symbol, raw_dir: str) -> int:
+    """Chuẩn hoá confidence theo trọng số TF: 4H=0.45, 2H=0.35, 1H=0.20 → 0..100"""
+    if raw_dir not in ("LONG","SHORT"):
+        return 0
+    weights = [("1h", 0.20), ("2h", 0.35), ("4h", 0.45)]
+    total = 0.0
+    for tf, w in weights:
+        df_tf = fetch_candles(symbol, tf)
+        sc = calc_tf_score(df_tf, raw_dir)
+        total += sc * w
+        time.sleep(60.0 / RPM)
+    return int(round(min(100, max(0, total * 100))))
+
+# ——— Position sizing (lot) theo % rủi ro & khoảng SL
+# ENV: ACCOUNT_EQUITY (mặc định 1000), RISK_PER_TRADE (mặc định 0.02 = 2%)
+ACCOUNT_EQUITY = float(os.getenv("ACCOUNT_EQUITY", "1000"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
+# Contract size mặc định (có thể override bằng JSON ở env CONTRACT_SIZES)
+_DEFAULT_CONTRACT_SIZES = {
+    "BTC/USD": 1,       # crypto CFD thường contract 1
+    "ETH/USD": 1,
+    "XAU/USD": 100,     # Gold 100 oz/lot
+    "XAU/USD (GOLD)": 100,
+    "CL": 1000,         # WTI oil 1000 barrels/lot (CFD thường scale theo broker)
+    "WTI OIL": 1000,
+    "EUR/USD": 100000,  # FX 100k units/lot
+    "USD/JPY": 100000,
+}
+def _load_contract_sizes():
+    try:
+        j = os.getenv("CONTRACT_SIZES", "")
+        if j:
+            user_map = json.loads(j)
+            for k,v in user_map.items():
+                _DEFAULT_CONTRACT_SIZES[str(k).upper()] = float(v)
+    except Exception:
+        pass
+    return _DEFAULT_CONTRACT_SIZES
+_CONTRACT_SIZES = _load_contract_sizes()
+
+def _lookup_contract(symbol: str, name: str) -> float:
+    # tra cứu theo symbol trước, rồi theo name
+    key1 = symbol.upper()
+    key2 = name.upper()
+    return float(_CONTRACT_SIZES.get(key1, _CONTRACT_SIZES.get(key2, 100000.0)))
+RISK_PCT = float(os.getenv("RISK_PCT", 0.02))     # 2%/lệnh
+BALANCE_USD = float(os.getenv("BALANCE_USD", 120))
+def compute_lot_size(entry: float, sl: float, symbol: str, name: str) -> float:
+    """Lot ≈ (equity*risk%) / (|entry-sl| * contract_value_per_point). 
+       Ở đây đơn giản hoá: contract_size ~ giá trị danh nghĩa/point."""
+    if entry is None or sl is None:
+        return 0.0
+    dist = abs(entry - sl)
+    if dist <= 0:
+        return 0.0
+    # risk tiền
+    risk_money = ACCOUNT_EQUITY * RISK_PER_TRADE
+    contract = _lookup_contract(symbol, name)
+    # đơn giản hoá: lot = risk / (dist * contract)
+    lots = risk_money / (dist * contract)
+    return float(max(0.0, round(lots, 3)))
 # ============ Daily cache (1D) ============
 def load_daily_cache():
     try:
@@ -597,15 +713,22 @@ def analyze_symbol(name, symbol, daily_cache):
         raw_dir = "SHORT"
     else:
         raw_dir = "SIDEWAY"
-
-    # Tính confidence đơn giản (mỗi phiếu = 33%), bonus nếu 1D trùng
-    raw_conf = 0
-    raw_conf += 33 * votes.count(raw_dir)
-    d1 = results.get("1D", "N/A")
-    if d1 == raw_dir:
-        raw_conf += 20
-    raw_conf = max(0, min(100, raw_conf))
     
+    # === (NEW) Chuẩn hoá confidence có trọng số TF
+    raw_conf = weighted_confidence(symbol, raw_dir)
+    # === (NEW) Filter sideway chặt hơn theo ADX & BBWidth (2H làm chính)
+    df2 = fetch_candles(symbol, "2h")
+    bw2 = bb_width(df2, 20) if df2 is not None else np.nan
+    a2  = adx(df2, 14) if df2 is not None else np.nan
+    # Ngưỡng khác nhau theo loại sản phẩm
+    if is_crypto(symbol) or is_crypto(name):
+        BW_MIN = 0.020   # 2.0%
+    elif is_commodity(symbol) or is_commodity(name):
+        BW_MIN = 0.015   # 1.5%
+    else:  # FX
+        BW_MIN = 0.012   # 1.2%
+
+    sideway_block = (np.isnan(a2) or a2 < 20) or (np.isnan(bw2) or bw2 < BW_MIN)    
     # Nếu có fast_bear mà memory vẫn giữ conf cao, ép kẹp xuống mức vừa tính
     fast_bear = detect_fast_flip_2h(symbol)
     if fast_bear:
@@ -643,67 +766,63 @@ def analyze_symbol(name, symbol, daily_cache):
         state[symbol]["conf"] = final_conf
     save_state(state)
 
-    # ===== Entry/SL/TP từ khung CHÍNH (mặc định 2H, có thể đổi qua biến môi trường MAIN_TF) =====
+    # ===== Entry/SL/TP (GIỮ NGUYÊN cấu trúc cũ của bạn) =====
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
-    
-    MAIN_TF = os.getenv("MAIN_TF", "2h")  # "2h" / "4h" / "1h" tùy bạn
+    lots = 0.0
+
+    MAIN_TF = os.getenv("MAIN_TF", "2h")  # giữ env như bạn đang dùng
     df_main = fetch_candles(symbol, MAIN_TF)
-    
+
     if df_main is not None and len(df_main) > 60:
-        entry = float(df_main["close"].iloc[-2])
+        entry  = float(df_main["close"].iloc[-2])  # dùng nến đã đóng
         atrval = atr(df_main, 14)
-        swing_hi, swing_lo = swing_levels(df_main, 20)  # đỉnh/đáy gần
-    
+        swing_hi, swing_lo = swing_levels(df_main, 20)
+
         # hệ số ATR theo loại sản phẩm (giữ quy ước cũ)
-        is_fx = name in ("EUR/USD", "USD/JPY")
-        base_mult = 2.5 if is_fx else 1.5
-    
-        # ===== LONG =====
-        if final_dir == "LONG" and final_conf >= CONF_THRESHOLD:
-            plan = "LONG"
-            # SL: lấy xa hơn giữa ATR*mult và đáy gần - buffer
-            sl_candidates = [
-                entry - base_mult * atrval,
-                (swing_lo - 0.3 * atrval) if not np.isnan(swing_lo) else entry - base_mult * atrval
-            ]
-            sl = min(sl_candidates)
-            R = entry - sl
-    
-            # TP “thông minh”:
-            #   - giữ RR hợp lý (1.2–1.8R)
-            #   - không vượt 3×ATR
-            #   - không chọc quá đỉnh gần + buffer
-            rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
-    
-            cap = None
-            if not np.isnan(swing_hi):
-                cap = max(0.8 * atrval, (swing_hi + 0.4 * atrval) - entry)
-            tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
-            tp = entry + tp_dist
-    
-        # ===== SHORT =====
-        elif final_dir == "SHORT" and final_conf >= CONF_THRESHOLD:
-            plan = "SHORT"
-            # SL: lấy xa hơn giữa ATR*mult và đỉnh gần + buffer
-            sl_candidates = [
-                entry + base_mult * atrval,
-                (swing_hi + 0.3 * atrval) if not np.isnan(swing_hi) else entry + base_mult * atrval
-            ]
-            sl = max(sl_candidates)
-            R = sl - entry
-    
-            rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
-    
-            cap = None
-            if not np.isnan(swing_lo):
-                cap = max(0.8 * atrval, entry - (swing_lo - 0.4 * atrval))
-            tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
-            tp = entry - tp_dist
-    # ===== Hết block SL/TP =====
+        base_mult = 2.5 if is_fx(symbol) or is_fx(name) else 1.5
+
+        # (NEW) sideway filter: nếu sideway_block → KHÔNG đề xuất lệnh
+        if sideway_block:
+            plan = "SIDEWAY"
+            entry = sl = tp = None
+        else:
+            if final_dir == "LONG" and final_conf >= CONF_THRESHOLD:
+                plan = "LONG"
+                sl_candidates = [
+                    entry - base_mult * atrval,
+                    (swing_lo - 0.3 * atrval) if not np.isnan(swing_lo) else entry - base_mult * atrval
+                ]
+                sl = min(sl_candidates)
+                R = entry - sl
+                rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
+                cap = None
+                if not np.isnan(swing_hi):
+                    cap = max(0.8 * atrval, (swing_hi + 0.4 * atrval) - entry)
+                tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
+                tp = entry + tp_dist
+
+            elif final_dir == "SHORT" and final_conf >= CONF_THRESHOLD:
+                plan = "SHORT"
+                sl_candidates = [
+                    entry + base_mult * atrval,
+                    (swing_hi + 0.3 * atrval) if not np.isnan(swing_hi) else entry + base_mult * atrval
+                ]
+                sl = max(sl_candidates)
+                R = sl - entry
+                rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
+                cap = None
+                if not np.isnan(swing_lo):
+                    cap = max(0.8 * atrval, entry - (swing_lo - 0.4 * atrval))
+                tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
+                tp = entry - tp_dist
+
+        # (NEW) Position sizing — chỉ khi có SL/TP hợp lệ
+        if entry is not None and sl is not None and tp is not None:
+            lots = compute_lot_size(entry, sl, symbol, name)
 
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
-    return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf))
+    return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -730,7 +849,7 @@ def main():
     any_symbol_has_data = False
 
     for name, sym in symbols.items():
-        results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf = analyze_symbol(name, sym, daily_cache)
+        results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf, lots = analyze_symbol(name, sym, daily_cache)
         # Cảnh báo fast-flip 2H nếu có
         df_2h_check = fetch_candles(sym, "2h")
         fast_flip = False
@@ -760,10 +879,11 @@ def main():
             lines.append("⚠️ Pullback: 1H ngược 4H/1D (UP) – cân nhắc chờ xác nhận")
         
         # dòng Confidence có màu & size gợi ý
-        lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime}")
+        lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime}") 
+        #| Size: {size_label}")
         if fast_flip:
             lines.append(f"⚡ Fast-flip 2H active — chờ nến kế tiếp")        
-        #| Size: {size_label}")
+
         # thêm Confidence + Regime (không ảnh hưởng logic cũ)
         #regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
         #lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
@@ -773,6 +893,7 @@ def main():
                 f"Entry {format_price(name if name in ('EUR/USD','USD/JPY') else sym, entry)} | "
                 f"SL {format_price(name if name in ('EUR/USD','USD/JPY') else sym, sl)} | "
                 f"TP {format_price(name if name in ('EUR/USD','USD/JPY') else sym, tp)}"
+                + (f" | Size {lots:.3f} lot" if lots and lots > 0 else "")
             )
         lines.append("")
 
@@ -782,8 +903,6 @@ def main():
     # Nếu tất cả đều N/A/SIDEWAY & không có Entry -> vẫn gửi để biết trạng thái; nếu muốn có thể chặn tại đây
     #msg = "\n".join(lines)
     #send_telegram(msg)
-    # Chỉ gửi nếu có ít nhất 1 symbol có dữ liệu thật sự
-    # Chỉ gửi nếu có ít nhất 1 symbol KHÔNG N/A
     # Chỉ gửi nếu có ít nhất 1 symbol có Entry thật (không phải N/A)
     valid_msg = any(
     ("Entry" in l and not any(x in l for x in ["N/A", "None", "NaN"]))
