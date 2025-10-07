@@ -69,6 +69,16 @@ MIN_HOLD_MIN = 90                # phải giữ hướng tối thiểu 120 phút
 COOLDOWN_MIN = 60                 # sau khi đảo, chờ 60 phút mới được đảo nữa
 STATE_PATH = os.getenv("STATE_PATH", "/tmp/signal_state.json")
 SMOOTH_ALPHA = 0.5                # làm mượt confidence giữa các lần chạy (0..1)
+
+# --- Oil calibration (CL futures -> Exness XTIUSD) ---
+EXNESS_OIL_TICKER   = os.getenv("EXNESS_OIL_TICKER", "")  # vd: "XTIUSD" nếu provider của bạn có
+OIL_CALIB_CACHE     = os.getenv("OIL_CALIB_CACHE", "/tmp/oil_calib.json")
+OIL_CALIB_TTL_MIN   = int(os.getenv("OIL_CALIB_TTL_MIN", "60"))  # hiệu chuẩn lại mỗi 60 phút
+
+# Fallback thủ công nếu không auto được
+OIL_PRICE_SCALE_ENV  = float(os.getenv("OIL_PRICE_SCALE", "1.0"))   # a
+OIL_PRICE_OFFSET_ENV = float(os.getenv("OIL_PRICE_OFFSET", "-16.0"))# b
+
 # ================ HELPERS ================
 def fetch_candles(symbol, interval, retries=3):
     key = (symbol, interval)
@@ -666,7 +676,81 @@ def decide_signal_color(results: dict, final_dir: str, final_conf: int):
 
     # RED – yếu/không rõ
     return "🔴", "SKIP"
-    
+
+def is_wti_name(name: str) -> bool:
+    return name in ("WTI Oil", "USOIL", "XTIUSD")
+
+def _load_oil_calib_cache():
+    try:
+        with open(OIL_CALIB_CACHE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_oil_calib_cache(d):
+    try:
+        with open(OIL_CALIB_CACHE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+def _minutes_since(ts_iso: str) -> float:
+    try:
+        t = datetime.fromisoformat(ts_iso)
+        return (datetime.now(timezone.utc) - t).total_seconds()/60.0
+    except Exception:
+        return 1e9
+
+def compute_oil_calibration() -> tuple[float, float]:
+    """
+    Trả về (scale, offset) để chuyển giá CL -> Exness.
+    Nếu có EXNESS_OIL_TICKER:
+      - Lấy CL và EXNESS_OIL_TICKER (cùng interval 1h), căn chỉnh theo datetime
+      - offset = median(exness - cl) trên 50 nến gần nhất
+      - scale = 1.0 (đơn giản, đủ tốt vì khác biệt chủ yếu là mặt bằng)
+    Nếu fail -> dùng ENV fallback.
+    Có cache theo TTL để đỡ tốn API.
+    """
+    # cache
+    cache = _load_oil_calib_cache()
+    if cache.get("ts") and _minutes_since(cache["ts"]) < OIL_CALIB_TTL_MIN:
+        return float(cache.get("scale", OIL_PRICE_SCALE_ENV)), float(cache.get("offset", OIL_PRICE_OFFSET_ENV))
+
+    # nếu không chỉ định ticker exness -> fallback ENV
+    if not EXNESS_OIL_TICKER:
+        return (OIL_PRICE_SCALE_ENV, OIL_PRICE_OFFSET_ENV)
+
+    df_cl  = fetch_candles("CL", "1h")
+    df_ex  = fetch_candles(EXNESS_OIL_TICKER, "1h")
+    if df_cl is None or df_ex is None or len(df_cl) < 10 or len(df_ex) < 10:
+        return (OIL_PRICE_SCALE_ENV, OIL_PRICE_OFFSET_ENV)
+
+    # join theo datetime
+    x = df_cl[["datetime", "close"]].rename(columns={"close":"cl"}).copy()
+    y = df_ex[["datetime", "close"]].rename(columns={"close":"ex"}).copy()
+    z = pd.merge_asof(x.sort_values("datetime"), y.sort_values("datetime"),
+                      on="datetime", direction="nearest", tolerance=pd.Timedelta("30min")).dropna()
+
+    if len(z) < 10:
+        return (OIL_PRICE_SCALE_ENV, OIL_PRICE_OFFSET_ENV)
+
+    z = z.tail(50)  # 50 điểm gần nhất
+    offset = float(np.median(z["ex"] - z["cl"]))
+    scale  = 1.0
+
+    _save_oil_calib_cache({"ts": datetime.now(timezone.utc).isoformat(),
+                           "scale": scale, "offset": offset})
+    return (scale, offset)
+
+# sẽ được set khi chạy main()
+_OIL_SCALE = OIL_PRICE_SCALE_ENV
+_OIL_OFFSET = OIL_PRICE_OFFSET_ENV
+
+def oil_adjust(p: float) -> float:
+    if p is None or (isinstance(p, float) and np.isnan(p)): 
+        return p
+    return p * _OIL_SCALE + _OIL_OFFSET
+
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -816,11 +900,15 @@ def analyze_symbol(name, symbol, daily_cache):
                     cap = max(0.8 * atrval, entry - (swing_lo - 0.4 * atrval))
                 tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
                 tp = entry - tp_dist
-
+        # … sau khi đã có entry/sl/tp …
+        if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
+            entry = oil_adjust(entry)
+            sl    = oil_adjust(sl)
+            tp    = oil_adjust(tp)
         # (NEW) Position sizing — chỉ khi có SL/TP hợp lệ
         if entry is not None and sl is not None and tp is not None:
             lots = compute_lot_size(entry, sl, symbol, name)
-
+        
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots
 
@@ -840,7 +928,10 @@ def send_telegram(msg):
 def main():
     # luôn kiểm tra/làm mới cache 1D (chỉ fetch khi tới giờ/đúng ngày)
     daily_cache = maybe_refresh_daily_cache()
-
+    # === Hiệu chuẩn dầu tự động (nếu có ticker bên Exness) ===
+    global _OIL_SCALE, _OIL_OFFSET
+    _OIL_SCALE, _OIL_OFFSET = compute_oil_calibration()
+    logging.info(f"Oil calibration: scale={_OIL_SCALE:.4f}, offset={_OIL_OFFSET:.4f}")
     lines = []
     now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     lines.append("💵 TRADE GOODS")
