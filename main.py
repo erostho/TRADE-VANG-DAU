@@ -79,6 +79,30 @@ OIL_CALIB_TTL_MIN   = int(os.getenv("OIL_CALIB_TTL_MIN", "60"))  # hiệu chuẩ
 OIL_PRICE_SCALE_ENV  = float(os.getenv("OIL_PRICE_SCALE", "1.0"))   # a
 OIL_PRICE_OFFSET_ENV = float(os.getenv("OIL_PRICE_OFFSET", "-16.0"))# b
 
+# ====== PROP DESK SETTINGS ======
+# Confidence → risk map
+CONF_RISK_TABLE = [
+    (85, 0.012),  # ≥85%: 1.2% equity
+    (70, 0.008),  # 70–84%: 0.8%
+    (55, 0.005),  # 55–69%: 0.5%
+    (0,  0.003),  # <55%: 0.3% (nhưng thường không trade)
+]
+
+# Daily risk cap & circuit breakers
+DAILY_RISK_CAP_PCT   = float(os.getenv("DAILY_RISK_CAP_PCT", "0.02"))  # 2%/ngày
+MAX_LOSING_STREAK    = int(os.getenv("MAX_LOSING_STREAK", "3"))        # thua 3 lệnh/ngày thì ngưng
+CB_COOLDOWN_MIN      = int(os.getenv("CB_COOLDOWN_MIN", "120"))         # nghỉ 120'
+STATS_PATH           = os.getenv("STATS_PATH", "/tmp/prop_stats.json")  # track risk, streak
+
+# News filter (tuỳ chọn – có là dùng, không có thì bỏ qua)
+NEWS_FILTER_ON       = os.getenv("NEWS_FILTER_ON", "0") == "0"            # 1 là mở
+NEWS_LOOKAHEAD_MIN   = int(os.getenv("NEWS_LOOKAHEAD_MIN", "60"))       # 60' trước/sau tin
+TRADING_ECON_API_KEY = os.getenv("TRADING_ECON_API_KEY", "")            # optional
+NEWS_CACHE_PATH      = os.getenv("NEWS_CACHE_PATH", "/tmp/news_today.json")
+
+# Signal log (để backtest/expectancy offline)
+SIGNAL_CSV_PATH      = os.getenv("SIGNAL_CSV_PATH", "/tmp/signals.csv")
+
 # ================ HELPERS ================
 def fetch_candles(symbol, interval, retries=3):
     key = (symbol, interval)
@@ -426,6 +450,31 @@ def compute_lot_size(entry: float, sl: float, symbol: str, name: str) -> float:
     # đơn giản hoá: lot = risk / (dist * contract)
     lots = risk_money / (dist * contract)
     return float(max(0.0, round(lots, 3)))
+CONTRACT_SIZES={"XAU/USD":100,"XAG/USD":5000,"EUR/USD":100000,"USD/JPY":100000,"BTC/USD":1,"CL":1000}
+def is_fx_name(n): return n in ("EUR/USD","USD/JPY")
+
+def account_equity_usd():
+    try:
+        v=float(os.getenv("BALANCE_USD","0"))
+        if v>0: return v
+    except Exception: pass
+    return 100.0
+
+def compute_lot_size(entry, sl, symbol, name, risk_pct=0.005):
+    if entry is None or sl is None: return 0.0
+    dist=abs(entry-sl); 
+    if dist<=0: return 0.0
+    key=name if name in CONTRACT_SIZES else symbol
+    contract=CONTRACT_SIZES.get(key,100000)
+    if "JPY" in key: pipsize=0.01
+    elif "XAU" in key: pipsize=0.1
+    elif key=="CL": pipsize=0.01
+    elif "/" in key: pipsize=0.0001
+    else: pipsize=1.0
+    value_per_point=contract*pipsize
+    risk_money=account_equity_usd()*risk_pct
+    lots=risk_money/max(1e-9,(dist*value_per_point))
+    return round(max(lots,0.01),3)
 # ============ Daily cache (1D) ============
 def load_daily_cache():
     try:
@@ -750,7 +799,122 @@ def oil_adjust(p: float) -> float:
     if p is None or (isinstance(p, float) and np.isnan(p)): 
         return p
     return p * _OIL_SCALE + _OIL_OFFSET
+# ---------- day stats / circuit breaker ----------
+def load_stats():
+    try:
+        with open(STATS_PATH, "r", encoding="utf-8") as f: s = json.load(f)
+    except Exception: s = {}
+    today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    if s.get("date") != today:
+        s = {"date": today, "risk_used": 0.0, "losing_streak": 0, "cb_until_ts": None}
+    return s
 
+def save_stats(s):
+    try:
+        with open(STATS_PATH, "w", encoding="utf-8") as f: json.dump(s, f, ensure_ascii=False)
+    except Exception: pass
+
+def is_circuit_breaker_on(stats):
+    ts = stats.get("cb_until_ts")
+    if not ts: return False
+    try: until = datetime.fromisoformat(ts)
+    except Exception: return False
+    return datetime.now(timezone.utc) < until
+
+def trigger_circuit_breaker(stats, minutes=CB_COOLDOWN_MIN):
+    stats["cb_until_ts"] = (datetime.now(timezone.utc)+timedelta(minutes=minutes)).isoformat()
+
+# ---------- confidence calibration ----------
+def _tf_weighted_conf(results):
+    def norm(x): return "MIX" if isinstance(x,str) and x.startswith("Mixed") else x
+    g15, g12, g4, d1 = (norm(results.get(k,"N/A")) for k in ("15m-30m","1H-2H","4H","1D"))
+    score=w=0.0
+    for v,wt in [(g15,0.5),(g12,1.0),(g4,1.3),(d1,0.7)]:
+        if v in ("LONG","SHORT"): score+=wt
+        elif v=="MIX": score+=0.3*wt
+        w+=wt
+    return 100.0*(score/max(1e-6,w))
+
+def calibrate_confidence(raw_conf, results, final_dir):
+    tfc = _tf_weighted_conf(results)
+    pen = 0
+    if isinstance(results.get("1H-2H",""),str) and results["1H-2H"].startswith("Mixed"): pen+=8
+    if results.get("4H")=="SIDEWAY": pen+=12
+    conf = 0.6*raw_conf + 0.4*tfc - pen
+    if final_dir=="SIDEWAY": conf=min(conf,50)
+    return int(max(0,min(100,round(conf))))
+
+def dynamic_risk_pct(conf_pct, regime):
+    base=0.003
+    for th,r in CONF_RISK_TABLE:
+        if conf_pct>=th: base=r; break
+    if regime=="RANGE": base*=0.6
+    return base
+
+# ---------- news filter (optional) ----------
+def _relevant_currencies(symbol_name):
+    s=symbol_name.upper()
+    if "XAU" in s or "GOLD" in s: return ["USD"]
+    if "XAG" in s or "SILVER" in s: return ["USD"]
+    if "BTC" in s or "ETH" in s: return ["USD"]
+    if "EUR" in s and "USD" in s: return ["EUR","USD"]
+    if "USD" in s and "JPY" in s: return ["USD","JPY"]
+    if "OIL" in s or s=="CL": return ["USD"]
+    return ["USD"]
+
+def _load_news_cache():
+    try: 
+        with open(NEWS_CACHE_PATH,"r",encoding="utf-8") as f: return json.load(f)
+    except Exception: return {"date":None,"events":[]}
+
+def _save_news_cache(c):
+    try:
+        with open(NEWS_CACHE_PATH,"w",encoding="utf-8") as f: json.dump(c,f,ensure_ascii=False)
+    except Exception: pass
+
+def refresh_news_today():
+    cache=_load_news_cache()
+    today=datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    if cache.get("date")==today: return cache["events"]
+    if not TRADING_ECON_API_KEY:
+        c={"date":today,"events":[]}; _save_news_cache(c); return []
+    try:
+        url=f"https://api.tradingeconomics.com/calendar?d1={today}&d2={today}&c=all&format=json&client={TRADING_ECON_API_KEY}"
+        r=requests.get(url,timeout=10); raw=r.json() if r.status_code==200 else []
+    except Exception: raw=[]
+    ev=[]
+    for e in raw:
+        try:
+            imp=(e.get("Importance","") or e.get("Impact","")).lower()
+            if "high" not in imp: continue
+            cc=(e.get("Country","") or e.get("Currency","") or "").upper()
+            dt=e.get("DateTime","") or e.get("Date","")
+            when=pd.to_datetime(dt,utc=True).to_pydatetime()
+            ev.append({"ccy":cc,"when":when.isoformat()})
+        except Exception: continue
+    _save_news_cache({"date":today,"events":ev})
+    return ev
+
+def news_blackout(symbol_name, lookahead_min=NEWS_LOOKAHEAD_MIN):
+    if not NEWS_FILTER_ON: return (False,"")
+    events=refresh_news_today()
+    if not events: return (False,"")
+    now=datetime.now(timezone.utc); rel=_relevant_currencies(symbol_name)
+    for e in events:
+        try: when=datetime.fromisoformat(e["when"])
+        except Exception: continue
+        if e["ccy"] in rel and abs((when-now).total_seconds())<=lookahead_min*60:
+            return (True,f"Tin mạnh ({e['ccy']}) ±{lookahead_min}’")
+    return (False,"")
+
+def log_signal(symbol, plan, entry, sl, tp, conf, regime, lots, reason=""):
+    need_hdr = not os.path.exists(SIGNAL_CSV_PATH)
+    try:
+        with open(SIGNAL_CSV_PATH,"a",encoding="utf-8") as f:
+            if need_hdr: f.write("ts,symbol,plan,entry,sl,tp,conf,regime,lots,reason\n")
+            t=datetime.now(timezone.utc).isoformat()
+            f.write(f"{t},{symbol},{plan},{entry},{sl},{tp},{conf},{regime},{lots},{reason}\n")
+    except Exception: pass
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -836,7 +1000,16 @@ def analyze_symbol(name, symbol, daily_cache):
             else:
                 raw_dir  = "SHORT"
                 raw_conf = max(raw_conf, 65)
+    # === PROP DESK GUARDS ===
+    raw_conf = calibrate_confidence(raw_conf, results, raw_dir)
+    regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
     
+    blocked_news, news_msg = news_blackout(name)
+    stats = load_stats()
+    cb_on  = is_circuit_breaker_on(stats)
+    block_reason = ""
+    if blocked_news: block_reason = f"NEWS: {news_msg}"
+    elif cb_on:      block_reason = "Circuit breaker cooling"
     # Áp dụng hysteresis & memory
     state = load_state()
     final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
@@ -908,7 +1081,22 @@ def analyze_symbol(name, symbol, daily_cache):
         # (NEW) Position sizing — chỉ khi có SL/TP hợp lệ
         if entry is not None and sl is not None and tp is not None:
             lots = compute_lot_size(entry, sl, symbol, name)
+        lots = 0.0
+        if entry is not None and sl is not None and tp is not None and not block_reason:
+            rpct = dynamic_risk_pct(final_conf, regime)
+            lots = compute_lot_size(entry, sl, symbol, name, risk_pct=rpct)
         
+            est_risk_money = account_equity_usd()*rpct
+            day_cap_money  = account_equity_usd()*DAILY_RISK_CAP_PCT
+            if stats["risk_used"] + est_risk_money > day_cap_money:
+                # chặn vì quá trần rủi ro ngày
+                plan = "SIDEWAY"; entry = sl = tp = None
+                block_reason = f"Daily risk cap reached ({int(DAILY_RISK_CAP_PCT*100)}%)"
+            else:
+                stats["risk_used"] += est_risk_money
+                save_stats(stats)
+                # log cho backtest
+                log_signal(name, plan, entry, sl, tp, final_conf, regime, lots)
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots
 
@@ -984,9 +1172,10 @@ def main():
                 f"Entry {format_price(name if name in ('EUR/USD','USD/JPY') else sym, entry)} | "
                 f"SL {format_price(name if name in ('EUR/USD','USD/JPY') else sym, sl)} | "
                 f"TP {format_price(name if name in ('EUR/USD','USD/JPY') else sym, tp)}"
-                + (f" | Size {lots:.3f} lot" if lots and lots > 0 else "")
+                + (f" | Size {lots:.3f} lot" if lots and lots>0 else "")
             )
-        lines.append("")
+        elif block_reason:
+            lines.append(f"⛔ {block_reason}")
 
         # dàn request để không vượt quota
         time.sleep(10)
