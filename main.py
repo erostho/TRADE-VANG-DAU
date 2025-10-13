@@ -95,7 +95,7 @@ CB_COOLDOWN_MIN      = int(os.getenv("CB_COOLDOWN_MIN", "120"))         # nghỉ
 STATS_PATH           = os.getenv("STATS_PATH", "/tmp/prop_stats.json")  # track risk, streak
 
 # News filter (tuỳ chọn – có là dùng, không có thì bỏ qua)
-NEWS_FILTER_ON       = os.getenv("NEWS_FILTER_ON", "0") == "0"            # 1 là mở
+NEWS_FILTER_ON       = os.getenv("NEWS_FILTER_ON", "1") == "1"            # 1 là mở
 NEWS_LOOKAHEAD_MIN   = int(os.getenv("NEWS_LOOKAHEAD_MIN", "60"))       # 60' trước/sau tin
 TRADING_ECON_API_KEY = os.getenv("TRADING_ECON_API_KEY", "")            # optional
 NEWS_CACHE_PATH      = os.getenv("NEWS_CACHE_PATH", "/tmp/news_today.json")
@@ -187,36 +187,6 @@ def keltner_mid(df, n=20, atr_mult=1.0):
     a = atr(df, 14)
     return mid_val, mid_val + atr_mult*a, mid_val - atr_mult*a
 
-def strong_trend(df):
-    """Trả LONG/SHORT/SIDEWAY cho 1 khung thời gian (dùng nến đã ĐÓNG)."""
-    if df is None or len(df) < 65:
-        return "N/A"
-
-    e20 = ema(df["close"], 20)
-    e50 = ema(df["close"], 50)
-    if len(e20) < 60 or np.isnan(e20.iloc[-2]) or np.isnan(e50.iloc[-2]):
-        return "N/A"
-
-    last = float(df["close"].iloc[-2])
-    # dốc EMA20 ~5 nến (đều là closed bar)
-    slope = (e20.iloc[-2] - e20.iloc[-7]) / max(1e-9, e20.iloc[-7]) * 100.0
-
-    # ADX (không có thì coi như pass)
-    try:
-        adx_val = adx(df, 14)
-        adx_ok = (not np.isnan(adx_val)) and adx_val >= 18
-    except Exception:
-        adx_ok = True
-
-    SLOPE_UP = 0.15
-    SLOPE_DN = -0.15
-
-    long_cond  = (last > e20.iloc[-2] > e50.iloc[-2]) and (slope > SLOPE_UP) and adx_ok
-    short_cond = (last < e20.iloc[-2] < e50.iloc[-2]) and (slope < SLOPE_DN) and adx_ok
-
-    if long_cond:  return "LONG"
-    if short_cond: return "SHORT"
-    return "SIDEWAY"
 def strong_trend(df):
     """Trả LONG/SHORT/SIDEWAY cho 1 khung thời gian (dùng nến đã ĐÓNG)."""
     if df is None or len(df) < 65:
@@ -399,7 +369,6 @@ def weighted_confidence(symbol, raw_dir: str) -> int:
         df_tf = fetch_candles(symbol, tf)
         sc = calc_tf_score(df_tf, raw_dir)
         total += sc * w
-        time.sleep(60.0 / RPM)
     return int(round(min(100, max(0, total * 100))))
 
 # ——— Position sizing (lot) theo % rủi ro & khoảng SL
@@ -436,20 +405,6 @@ def _lookup_contract(symbol: str, name: str) -> float:
     return float(_CONTRACT_SIZES.get(key1, _CONTRACT_SIZES.get(key2, 100000.0)))
 RISK_PCT = float(os.getenv("RISK_PCT", 0.02))     # 2%/lệnh
 BALANCE_USD = float(os.getenv("BALANCE_USD", 120))
-def compute_lot_size(entry: float, sl: float, symbol: str, name: str) -> float:
-    """Lot ≈ (equity*risk%) / (|entry-sl| * contract_value_per_point). 
-       Ở đây đơn giản hoá: contract_size ~ giá trị danh nghĩa/point."""
-    if entry is None or sl is None:
-        return 0.0
-    dist = abs(entry - sl)
-    if dist <= 0:
-        return 0.0
-    # risk tiền
-    risk_money = ACCOUNT_EQUITY * RISK_PER_TRADE
-    contract = _lookup_contract(symbol, name)
-    # đơn giản hoá: lot = risk / (dist * contract)
-    lots = risk_money / (dist * contract)
-    return float(max(0.0, round(lots, 3)))
 CONTRACT_SIZES={"XAU/USD":100,"XAG/USD":5000,"EUR/USD":100000,"USD/JPY":100000,"BTC/USD":1,"CL":1000}
 def is_fx_name(n): return n in ("EUR/USD","USD/JPY")
 
@@ -1081,7 +1036,6 @@ def analyze_symbol(name, symbol, daily_cache):
         # (NEW) Position sizing — chỉ khi có SL/TP hợp lệ
         if entry is not None and sl is not None and tp is not None:
             lots = compute_lot_size(entry, sl, symbol, name)
-        lots = 0.0
         if entry is not None and sl is not None and tp is not None and not block_reason:
             rpct = dynamic_risk_pct(final_conf, regime)
             lots = compute_lot_size(entry, sl, symbol, name, risk_pct=rpct)
@@ -1098,7 +1052,7 @@ def analyze_symbol(name, symbol, daily_cache):
                 # log cho backtest
                 log_signal(name, plan, entry, sl, tp, final_conf, regime, lots)
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
-    return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots
+    return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots, block_reason
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1128,7 +1082,7 @@ def main():
     any_symbol_has_data = False
 
     for name, sym in symbols.items():
-        results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf, lots = analyze_symbol(name, sym, daily_cache)
+        results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf, lots, block_reason = analyze_symbol(name, sym, daily_cache)
         # Cảnh báo fast-flip 2H nếu có
         df_2h_check = fetch_candles(sym, "2h")
         fast_flip = False
