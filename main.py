@@ -1162,43 +1162,44 @@ def analyze_symbol(name, symbol, daily_cache):
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
 
-        # === ENTRY WINDOW: reset mỗi khi có nến CHÍNH mới (vd 2h) ===
+
+        # ==== ENTRY WINDOW: reset theo nến CHÍNH mới (ví dụ 2h) ====
+        from datetime import datetime, timezone, timedelta
+        
+        ENTRY_WINDOW_MIN = int(os.getenv("ENTRY_WINDOW_MIN", "30"))  # ví dụ 30'
+        
+        def _to_utc(dt_like):
+            # đảm bảo datetime có timezone UTC (không dùng .replace)
+            return pd.to_datetime(dt_like, utc=True).to_pydatetime()
+        
         try:
-            # thời điểm nến đã ĐÓNG dùng làm tín hiệu (khớp với entry = close[-2])
-            last_closed_ts = pd.to_datetime(df_main["datetime"].iloc[-2]).to_pydatetime()
+            # timestamp của NẾN ĐÃ ĐÓNG dùng để tính entry (khớp entry = close[-2])
+            last_closed = _to_utc(df_main["datetime"].iloc[-2])
         
-            # dùng state sẵn có để nhớ timestamp của nến tín hiệu
-            sym_state = state.setdefault(symbol, {})
-            prev_lc_iso = sym_state.get("last_closed_main_tf")  # lần trước
-            prev_lc = datetime.fromisoformat(prev_lc_iso) if prev_lc_iso else None
+            state = load_state()
+            sym_key = symbol  # luôn dùng symbol làm key
+            s = state.setdefault(sym_key, {})
         
-            # nếu đã sang nến mới -> reset “cửa sổ vào lệnh” về mốc nến vừa đóng
-            if prev_lc is None or prev_lc != last_closed_ts:
-                sym_state["last_closed_main_tf"] = last_closed_ts.isoformat()
-                sym_state["entry_open_from"] = last_closed_ts.isoformat()
+            prev_bar_iso = s.get("last_closed_main_tf")
+            prev_bar = datetime.fromisoformat(prev_bar_iso) if prev_bar_iso else None
+        
+            # Nếu có nến đóng mới -> reset cửa sổ Entry về đúng mốc nến này
+            if (prev_bar is None) or (prev_bar != last_closed):
+                s["last_closed_main_tf"] = last_closed.isoformat()
+                s["entry_open_from"]     = last_closed.isoformat()
                 save_state(state)
         
-            # tính phút đã trôi qua kể từ lúc nến đó đóng
-            base_iso = sym_state.get("entry_open_from", sym_state.get("last_closed_main_tf"))
-            if base_iso:
-                base_ts = datetime.fromisoformat(base_iso)
-                now_utc = datetime.now(timezone.utc)
-                # nếu datetime của df_main là naive, coi như UTC
-                if base_ts.tzinfo is None:
-                    base_ts = base_ts.replace(tzinfo=timezone.utc)
-                elapsed_min = (now_utc - base_ts).total_seconds() / 60.0
+            # Tính thời lượng đã trôi qua kể từ lúc nến đóng (tức lúc mở cửa sổ)
+            entry_from = datetime.fromisoformat(state[sym_key]["entry_open_from"])
+            age_min = (datetime.now(timezone.utc) - entry_from).total_seconds() / 60.0
         
-                # quá cửa sổ → không đề xuất entry/SL/TP, chỉ báo lý do
-                if elapsed_min > ENTRY_WINDOW_MIN:
-                    block_reason = f"Entry window expired ({int(elapsed_min)}’)"
-        
-                    # nếu bạn muốn NGỪNG đề xuất lệnh sau khi hết hạn:
-                    plan = "SIDEWAY"
-                    entry = sl = tp = None
-                    lots = 0.0
-        
+            # Hết cửa sổ -> không đề xuất lệnh
+            if age_min > ENTRY_WINDOW_MIN:
+                plan = "SIDEWAY"
+                entry = sl = tp = None
+                block_reason = f"Entry window expired ({int(age_min)}’)"
         except Exception as e:
-            logging.warning(f"[entry-window] {symbol}: {e}")
+            logging.warning(f"[ENTRY WINDOW] fallback: {e}")
         # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
         # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
         reasons = []
