@@ -1112,15 +1112,12 @@ def analyze_symbol(name, symbol, daily_cache):
 
     MAIN_TF = os.getenv("MAIN_TF", "2h")  # giữ env như bạn đang dùng
     df_main = fetch_candles(symbol, MAIN_TF)
-
     if df_main is not None and len(df_main) > 60:
         entry  = float(df_main["close"].iloc[-2])  # dùng nến đã đóng
         atrval = atr(df_main, 14)
         swing_hi, swing_lo = swing_levels(df_main, 20)
-
         # hệ số ATR theo loại sản phẩm (giữ quy ước cũ)
         base_mult = 2.5 if is_fx(symbol) or is_fx(name) else 1.5
-
         # (NEW) sideway filter: nếu sideway_block → KHÔNG đề xuất lệnh
         if sideway_block:
             plan = "SIDEWAY"
@@ -1161,45 +1158,73 @@ def analyze_symbol(name, symbol, daily_cache):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-
-
-        # ==== ENTRY WINDOW: reset theo nến CHÍNH mới (ví dụ 2h) ====
+        # ==== ENTRY WINDOW (robust) ====
         from datetime import datetime, timezone, timedelta
         
-        ENTRY_WINDOW_MIN = int(os.getenv("ENTRY_WINDOW_MIN", "30"))  # ví dụ 30'
+        ENTRY_WINDOW_MIN = int(os.getenv("ENTRY_WINDOW_MIN", "30"))   # cửa sổ vào lệnh (phút)
+        
+        def tf_minutes(tf: str) -> int:
+            tf = (tf or "2h").lower().strip()
+            if tf.endswith("min") or tf.endswith("m"):
+                return int(''.join([c for c in tf if c.isdigit()]))
+            if tf.endswith("h"):
+                return int(''.join([c for c in tf if c.isdigit()])) * 60
+            if tf.endswith("d"):
+                return int(''.join([c for c in tf if c.isdigit()])) * 1440
+            return 120  # fallback
+        
+        MAIN_TF = os.getenv("MAIN_TF", "2h")
+        TF_MIN  = tf_minutes(MAIN_TF)
         
         def _to_utc(dt_like):
-            # đảm bảo datetime có timezone UTC (không dùng .replace)
+            # ép timezone đúng cách (không dùng .replace)
             return pd.to_datetime(dt_like, utc=True).to_pydatetime()
         
         try:
-            # timestamp của NẾN ĐÃ ĐÓNG dùng để tính entry (khớp entry = close[-2])
+            # nến ĐÃ ĐÓNG dùng để ra tín hiệu (khớp entry = close[-2])
             last_closed = _to_utc(df_main["datetime"].iloc[-2])
         
             state = load_state()
-            sym_key = symbol  # luôn dùng symbol làm key
-            s = state.setdefault(sym_key, {})
+            key   = symbol                          # luôn dùng SYMBOL làm key
+            s     = state.setdefault(key, {})
         
-            prev_bar_iso = s.get("last_closed_main_tf")
-            prev_bar = datetime.fromisoformat(prev_bar_iso) if prev_bar_iso else None
+            prev_bar = None
+            if s.get("last_closed_main_tf"):
+                try:
+                    prev_bar = datetime.fromisoformat(s["last_closed_main_tf"])
+                except Exception:
+                    prev_bar = None
         
-            # Nếu có nến đóng mới -> reset cửa sổ Entry về đúng mốc nến này
+            # ❶ Nếu thấy nến đóng mới => reset cửa sổ entry về đúng mốc nến đó
             if (prev_bar is None) or (prev_bar != last_closed):
                 s["last_closed_main_tf"] = last_closed.isoformat()
                 s["entry_open_from"]     = last_closed.isoformat()
                 save_state(state)
         
-            # Tính thời lượng đã trôi qua kể từ lúc nến đóng (tức lúc mở cửa sổ)
-            entry_from = datetime.fromisoformat(state[sym_key]["entry_open_from"])
-            age_min = (datetime.now(timezone.utc) - entry_from).total_seconds() / 60.0
+            # ❷ Tính tuổi cửa sổ từ mốc đã lưu
+            entry_from = datetime.fromisoformat(state[key]["entry_open_from"])
+            now_utc    = datetime.now(timezone.utc)
+            age_min    = (now_utc - entry_from).total_seconds() / 60.0
         
-            # Hết cửa sổ -> không đề xuất lệnh
+            # ❸ SANITY GUARDS: nếu vì bất kỳ lý do gì tuổi > 3×khung TF -> ép reset ngay
+            if age_min > 3 * TF_MIN:
+                s["last_closed_main_tf"] = last_closed.isoformat()
+                s["entry_open_from"]     = last_closed.isoformat()
+                save_state(state)
+                age_min = (now_utc - last_closed).total_seconds() / 60.0
+        
+            # ❹ Khoá nếu quá cửa sổ
             if age_min > ENTRY_WINDOW_MIN:
                 plan = "SIDEWAY"
                 entry = sl = tp = None
                 block_reason = f"Entry window expired ({int(age_min)}’)"
+        
+            # DEBUG (tạm thời giữ vài lần chạy để kiểm tra, rồi có thể comment)
+            logging.info(f"[ENTRY] {symbol} last_closed={last_closed} | entry_from={entry_from} | age={age_min:.1f}m | tf={TF_MIN}m")
+        
         except Exception as e:
             logging.warning(f"[ENTRY WINDOW] fallback: {e}")
+        
         # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
         # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
         reasons = []
