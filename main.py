@@ -89,7 +89,7 @@ CONF_RISK_TABLE = [
 ]
 
 # Daily risk cap & circuit breakers
-DAILY_RISK_CAP_PCT   = float(os.getenv("DAILY_RISK_CAP_PCT", "0.02"))  # 2%/ngày
+DAILY_RISK_CAP_PCT   = float(os.getenv("DAILY_RISK_CAP_PCT", "0.04"))  # 4%/ngày
 MAX_LOSING_STREAK    = int(os.getenv("MAX_LOSING_STREAK", "3"))        # thua 3 lệnh/ngày thì ngưng
 CB_COOLDOWN_MIN      = int(os.getenv("CB_COOLDOWN_MIN", "120"))         # nghỉ 120'
 STATS_PATH           = os.getenv("STATS_PATH", "/tmp/prop_stats.json")  # track risk, streak
@@ -870,6 +870,31 @@ def log_signal(symbol, plan, entry, sl, tp, conf, regime, lots, reason=""):
             t=datetime.now(timezone.utc).isoformat()
             f.write(f"{t},{symbol},{plan},{entry},{sl},{tp},{conf},{regime},{lots},{reason}\n")
     except Exception: pass
+# ---------- Fetch open positions risk ----------
+def fetch_open_positions_risk():
+    """
+    Giả lập tổng rủi ro của các lệnh đang mở (dựa theo file logs signals.csv).
+    Trong bản thực chiến, bạn có thể kết nối API của sàn (OKX, Exness, v.v.)
+    để lấy chính xác các lệnh đang mở và SL tương ứng.
+    """
+    total_risk_money = 0.0
+    try:
+        if not os.path.exists(SIGNAL_CSV_PATH):
+            return 0.0
+        df = pd.read_csv(SIGNAL_CSV_PATH)
+        df = df[df["plan"].isin(["LONG", "SHORT"])]
+        df = df.sort_values("ts", ascending=False).drop_duplicates("symbol")
+
+        eq = account_equity_usd()
+        for _, row in df.iterrows():
+            lots = float(row.get("lots", 0))
+            conf = float(row.get("conf", 0))
+            rpct = dynamic_risk_pct(conf, row.get("regime", "TREND"))
+            total_risk_money += eq * rpct
+        return total_risk_money
+    except Exception as e:
+        logging.warning(f"fetch_open_positions_risk failed: {e}")
+        return 0.0
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -1041,15 +1066,16 @@ def analyze_symbol(name, symbol, daily_cache):
             lots = compute_lot_size(entry, sl, symbol, name, risk_pct=rpct)
         
             est_risk_money = account_equity_usd()*rpct
-            day_cap_money  = account_equity_usd()*DAILY_RISK_CAP_PCT
-            if stats["risk_used"] + est_risk_money > day_cap_money:
-                # chặn vì quá trần rủi ro ngày
-                plan = "SIDEWAY"; entry = sl = tp = None
+            # --- New: Daily risk cap based on *actual open trades* ---
+            open_risk_money = fetch_open_positions_risk()
+            day_cap_money   = account_equity_usd() * DAILY_RISK_CAP_PCT
+            
+            if open_risk_money + (account_equity_usd() * rpct) > day_cap_money:
+                plan = "SIDEWAY"
+                entry = sl = tp = None
                 block_reason = f"Daily risk cap reached ({int(DAILY_RISK_CAP_PCT*100)}%)"
             else:
-                stats["risk_used"] += est_risk_money
-                save_stats(stats)
-                # log cho backtest
+                # Không cộng risk_used nữa (vì chỉ tính lệnh thực)
                 log_signal(name, plan, entry, sl, tp, final_conf, regime, lots)
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots, block_reason
