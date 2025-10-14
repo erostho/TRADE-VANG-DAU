@@ -1202,7 +1202,7 @@ def analyze_symbol(name, symbol, daily_cache):
                 save_state(state)
         
             # ❷ Tính tuổi cửa sổ từ mốc đã lưu
-            entry_from = datetime.fromisoformat(state[key]["entry_open_from"])
+            entry_from = datetime.fromisoformat(state[key]["entry_open_from"]).astimezone(timezone.utc)
             now_utc    = datetime.now(timezone.utc)
             age_min    = (now_utc - entry_from).total_seconds() / 60.0
         
