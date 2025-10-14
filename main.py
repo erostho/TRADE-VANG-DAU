@@ -102,7 +102,18 @@ NEWS_CACHE_PATH      = os.getenv("NEWS_CACHE_PATH", "/tmp/news_today.json")
 
 # Signal log (để backtest/expectancy offline)
 SIGNAL_CSV_PATH      = os.getenv("SIGNAL_CSV_PATH", "/tmp/signals.csv")
+# ===== INTRABAR GUARDS (real-time adaptation) =====
+INTRABAR_PRICE_DEVIATION_ATR = float(os.getenv("INTRABAR_DEV_ATR", "0.5"))  # lệch > 0.5*ATR -> bỏ tín hiệu
+ENTRY_WINDOW_MIN              = int(os.getenv("ENTRY_WINDOW_MIN", "30"))     # chỉ hợp lệ trong 30'
+MICROTREND_TF                 = os.getenv("MICROTREND_TF", "15min")          # khung xác nhận micro
+MICROTREND_ALLOW_SIDEWAY      = os.getenv("MICROTREND_ALLOW_SIDEWAY", "1") == "1"
 
+# Volatility regime
+VOL_BW_HIGH   = float(os.getenv("VOL_BW_HIGH", "0.025"))  # BBWidth 2h > 2.5% coi là biến động cao
+VOL_ATR_MULT  = float(os.getenv("VOL_ATR_MULT", "1.25"))  # ATR hiện tại > 1.25×ATR_20 coi là cao
+
+# Bias tracking
+BIAS_INVALIDATE_MIN = int(os.getenv("BIAS_INVALIDATE_MIN", "60"))  # 60' sau tín hiệu nếu mất bias thì huỷ
 # ================ HELPERS ================
 def fetch_candles(symbol, interval, retries=3):
     key = (symbol, interval)
@@ -430,6 +441,7 @@ def compute_lot_size(entry, sl, symbol, name, risk_pct=0.005):
     risk_money=account_equity_usd()*risk_pct
     lots=risk_money/max(1e-9,(dist*value_per_point))
     return round(max(lots,0.01),3)
+    
 # ============ Daily cache (1D) ============
 def load_daily_cache():
     try:
@@ -895,6 +907,96 @@ def fetch_open_positions_risk():
     except Exception as e:
         logging.warning(f"fetch_open_positions_risk failed: {e}")
         return 0.0
+def get_realtime_price(symbol: str) -> float | None:
+    """Lấy giá gần nhất (close của nến nhỏ) để kiểm tra lệch so với Entry."""
+    try:
+        df = fetch_candles(symbol, "15min")  # an toàn cho quota hơn 1m
+        if df is None or len(df) < 2:
+            return None
+        return float(df["close"].iloc[-1])   # giá hiện hành ~ close nến mới nhất
+    except Exception:
+        return None
+
+def micro_trend_ok(symbol: str, expect: str) -> bool:
+    """Xác nhận micro-trend (15m mặc định) cùng/không ngược với hướng kỳ vọng."""
+    df = fetch_candles(symbol, MICROTREND_TF)
+    d  = strong_trend(df)
+    if MICROTREND_ALLOW_SIDEWAY and d == "SIDEWAY":
+        return True
+    if expect in ("LONG","SHORT") and d in ("LONG","SHORT"):
+        return d == expect
+    return False
+
+def is_high_vol(symbol: str) -> bool:
+    """Định danh biến động cao theo BBWidth & ATR trên 2h."""
+    df2 = fetch_candles(symbol, "2h")
+    if df2 is None or len(df2) < 60:
+        return False
+    bw  = bb_width(df2, 20)
+    a   = atr(df2, 14)
+    a20 = pd.Series(df2["close"]).diff().abs().rolling(14).mean().iloc[-1]  # proxy mềm
+    cond_bw  = (not np.isnan(bw)) and bw > VOL_BW_HIGH
+    cond_atr = (not np.isnan(a)) and a20 and (a > VOL_ATR_MULT * a20)
+    return bool(cond_bw or cond_atr)
+
+def bias_invalidation(symbol: str, expect: str) -> bool:
+    """
+    Trả True nếu bias bị vô hiệu trong ~1h: RSI/MACD trái hướng liên tục 3 bar trên MICROTREND_TF.
+    """
+    df = fetch_candles(symbol, MICROTREND_TF)
+    if df is None or len(df) < 25:
+        return False
+    mh = df["close"].ewm(span=12, adjust=False).mean() - df["close"].ewm(span=26, adjust=False).mean()
+    sig= mh.ewm(span=9, adjust=False).mean()
+    hist = (mh - sig).tail(5)
+    rsi15 = rsi(df["close"], 14).tail(5)
+    if expect == "LONG":
+        return (hist.lt(0).tail(3).all()) and (rsi15.tail(3).lt(50).all())
+    if expect == "SHORT":
+        return (hist.gt(0).tail(3).all()) and (rsi15.tail(3).gt(50).all())
+    return False
+# ==== FILTER HELPERS (thêm) ====
+def has_volume_spike(df, n=20, mult=1.2):
+    """Volume nến đã ĐÓNG >= mult * MA(n). Nếu không có cột volume thì bỏ qua."""
+    if df is None or "volume" not in df.columns or len(df) < n + 2:
+        return True  # không có volume thì không chặn
+    v = pd.to_numeric(df["volume"], errors="coerce")
+    vma = v.rolling(n).mean().iloc[-2]
+    if np.isnan(v.iloc[-2]) or np.isnan(vma) or vma <= 0:
+        return True
+    return v.iloc[-2] >= mult * vma
+
+def is_bullish_engulfing(df):
+    """Nến -2 xanh phủ thân nến -3 đỏ."""
+    if df is None or len(df) < 3: return False
+    o2,c2 = float(df["open"].iloc[-2]),  float(df["close"].iloc[-2])
+    o3,c3 = float(df["open"].iloc[-3]),  float(df["close"].iloc[-3])
+    return (c2 > o2) and (c3 < o3) and (o2 <= c3) and (c2 >= o3)
+
+def is_bearish_engulfing(df):
+    """Nến -2 đỏ phủ thân nến -3 xanh."""
+    if df is None or len(df) < 3: return False
+    o2,c2 = float(df["open"].iloc[-2]),  float(df["close"].iloc[-2])
+    o3,c3 = float(df["open"].iloc[-3]),  float(df["close"].iloc[-3])
+    return (c2 < o2) and (c3 > o3) and (o2 >= c3) and (c2 <= o3)
+
+def is_bullish_pinbar(df, tol=0.33):
+    """Pin bar tăng: đuôi dưới dài (>= 2/3 toàn nến), đóng > mở."""
+    if df is None or len(df) < 2: return False
+    o,c,h,l = [float(df[x].iloc[-2]) for x in ["open","close","high","low"]]
+    rng = max(1e-9, h - l)
+    lower_tail = min(o,c) - l
+    body = abs(c - o)
+    return (c > o) and (lower_tail / rng >= tol) and (body / rng <= 1 - tol)
+
+def is_bearish_pinbar(df, tol=0.33):
+    """Pin bar giảm: đuôi trên dài (>= 2/3 toàn nến), đóng < mở."""
+    if df is None or len(df) < 2: return False
+    o,c,h,l = [float(df[x].iloc[-2]) for x in ["open","close","high","low"]]
+    rng = max(1e-9, h - l)
+    upper_tail = h - max(o,c)
+    body = abs(c - o)
+    return (c < o) and (upper_tail / rng >= tol) and (body / rng <= 1 - tol)
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -1058,6 +1160,92 @@ def analyze_symbol(name, symbol, daily_cache):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
+        # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
+        # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
+        reasons = []
+
+        # 4H bias phải trùng hướng trade
+        bias4 = _norm_dir(results.get("4H", "N/A"))
+        if final_dir in ("LONG","SHORT") and bias4 in ("LONG","SHORT") and bias4 != final_dir:
+            reasons.append("4H bias mismatch")
+
+        # RSI + MACD phải cùng hướng với final_dir (nến đã đóng)
+        try:
+            rsi_last = rsi(df_main["close"], 14).iloc[-2]
+            macd_h   = macd_hist(df_main["close"])
+            if final_dir == "LONG"  and (rsi_last < 55 or macd_h <= 0): reasons.append("RSI/MACD not aligned")
+            if final_dir == "SHORT" and (rsi_last > 45 or macd_h >= 0): reasons.append("RSI/MACD not aligned")
+        except Exception:
+            pass  # nếu lỗi chỉ báo thì không chặn
+
+        # Volume spike xác nhận (nếu có cột volume)
+        if not has_volume_spike(df_main, n=20, mult=1.2):
+            reasons.append("No volume confirmation")
+
+        # Price Action: Engulfing / Pin bar theo hướng
+        bull_ok = is_bullish_engulfing(df_main) or is_bullish_pinbar(df_main)
+        bear_ok = is_bearish_engulfing(df_main) or is_bearish_pinbar(df_main)
+        if final_dir == "LONG"  and not bull_ok:  reasons.append("No bullish PA (engulf/pin)")
+        if final_dir == "SHORT" and not bear_ok:  reasons.append("No bearish PA (engulf/pin)")
+
+        # RR phải đạt tối thiểu 1.8
+        if entry is not None and sl is not None and tp is not None:
+            rr_ratio = abs(tp - entry) / max(1e-9, abs(entry - sl))
+            if rr_ratio < 1.8:
+                reasons.append(f"RR too low ({rr_ratio:.2f} < 1.8)")
+
+        # Nếu có bất kỳ lý do -> huỷ đề xuất lệnh, ghi reason
+        if reasons:
+            plan = "SIDEWAY"
+            entry = sl = tp = None
+            lots = 0.0
+            # nếu bạn đã có biến block_reason trước đó:
+            try:
+                if block_reason:
+                    block_reason = block_reason + " | " + " | ".join(reasons)
+                else:
+                    block_reason = " | ".join(reasons)
+            except NameError:
+                block_reason = " | ".join(reasons)
+        # ==== (NEW) 5 GUARDS chống “đảo chiều giữa nến” ====
+
+        # 3.5. Trailing Entry Window: chỉ hợp lệ trong ENTRY_WINDOW_MIN kể từ lúc nến chính đóng
+        last_close_ts = pd.to_datetime(df_main["datetime"].iloc[-2]).to_pydatetime().replace(tzinfo=timezone.utc)
+        now_utc       = datetime.now(timezone.utc)
+        if (now_utc - last_close_ts) > timedelta(minutes=ENTRY_WINDOW_MIN):
+            plan = "SIDEWAY"; entry = sl = tp = None
+            block_reason = f"Entry window expired ({ENTRY_WINDOW_MIN}’)"
+        
+        # 1) Dynamic candle validation: giá hiện tại lệch quá xa Entry -> bỏ
+        if entry is not None and sl is not None and tp is not None:
+            px_now = get_realtime_price(symbol)
+            if px_now is not None and abs(px_now - entry) > INTRABAR_PRICE_DEVIATION_ATR * atrval:
+                plan = "SIDEWAY"; entry = sl = tp = None
+                block_reason = f"Price deviated > {INTRABAR_PRICE_DEVIATION_ATR}×ATR"
+
+        # 2) Micro-trend confirmation (15m cùng hướng hoặc ít nhất không ngược)
+        if entry is not None and sl is not None and tp is not None:
+            if not micro_trend_ok(symbol, final_dir):
+                plan = "SIDEWAY"; entry = sl = tp = None
+                block_reason = f"Micro-trend {MICROTREND_TF} disagrees"
+
+        # 3) Adaptive volatility regime: biến động cao thì bắt buộc micro-confirm chặt hơn
+        if entry is not None and sl is not None and tp is not None and is_high_vol(symbol):
+            # Trong chế độ high-vol chỉ cho đi khi micro-trend đúng hướng KÈM khoảng lệch rất nhỏ
+            px_now = px_now if 'px_now' in locals() and px_now is not None else get_realtime_price(symbol)
+            if (not micro_trend_ok(symbol, final_dir)) or (px_now is not None and abs(px_now - entry) > 0.3 * atrval):
+                plan = "SIDEWAY"; entry = sl = tp = None
+                block_reason = "High-volatility guard"
+
+        # 4) Real-time bias tracking: nếu bias bị vô hiệu trong ~1h -> bỏ
+        if entry is not None and sl is not None and tp is not None:
+            if bias_invalidation(symbol, final_dir):
+                plan = "SIDEWAY"; entry = sl = tp = None
+                block_reason = "Bias invalidated intrabar"
+
+        # 5) (giữ nguyên) — nếu tên là dầu WTI thì hiệu chỉnh sang quote Exness
+        if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
+            entry = oil_adjust(entry); sl = oil_adjust(sl); tp = oil_adjust(tp)
         # (NEW) Position sizing — chỉ khi có SL/TP hợp lệ
         if entry is not None and sl is not None and tp is not None:
             lots = compute_lot_size(entry, sl, symbol, name)
