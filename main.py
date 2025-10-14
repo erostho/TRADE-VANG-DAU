@@ -1246,15 +1246,7 @@ def analyze_symbol(name, symbol, daily_cache):
                     block_reason = " | ".join(reasons)
             except NameError:
                 block_reason = " | ".join(reasons)
-        # ==== (NEW) 5 GUARDS chống “đảo chiều giữa nến” ====
-
-        # 3.5. Trailing Entry Window: chỉ hợp lệ trong ENTRY_WINDOW_MIN kể từ lúc nến chính đóng
-        last_close_ts = pd.to_datetime(df_main["datetime"].iloc[-2]).to_pydatetime().replace(tzinfo=timezone.utc)
-        now_utc       = datetime.now(timezone.utc)
-        if (now_utc - last_close_ts) > timedelta(minutes=ENTRY_WINDOW_MIN):
-            plan = "SIDEWAY"; entry = sl = tp = None
-            block_reason = f"Entry window expired ({ENTRY_WINDOW_MIN}’)"
-        
+        # ==== (NEW) 5 GUARDS chống “đảo chiều giữa nến” ====        
         # 1) Dynamic candle validation: giá hiện tại lệch quá xa Entry -> bỏ
         if entry is not None and sl is not None and tp is not None:
             px_now = get_realtime_price(symbol)
