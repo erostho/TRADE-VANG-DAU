@@ -104,7 +104,7 @@ NEWS_CACHE_PATH      = os.getenv("NEWS_CACHE_PATH", "/tmp/news_today.json")
 SIGNAL_CSV_PATH      = os.getenv("SIGNAL_CSV_PATH", "/tmp/signals.csv")
 # ===== INTRABAR GUARDS (real-time adaptation) =====
 INTRABAR_PRICE_DEVIATION_ATR = float(os.getenv("INTRABAR_DEV_ATR", "0.5"))  # lệch > 0.5*ATR -> bỏ tín hiệu
-ENTRY_WINDOW_MIN             = 80
+#ENTRY_WINDOW_MIN             = 80
 MICROTREND_TF                 = os.getenv("MICROTREND_TF", "15min")          # khung xác nhận micro
 MICROTREND_ALLOW_SIDEWAY      = os.getenv("MICROTREND_ALLOW_SIDEWAY", "1") == "1"
 
@@ -1112,12 +1112,15 @@ def analyze_symbol(name, symbol, daily_cache):
 
     MAIN_TF = os.getenv("MAIN_TF", "2h")  # giữ env như bạn đang dùng
     df_main = fetch_candles(symbol, MAIN_TF)
+
     if df_main is not None and len(df_main) > 60:
         entry  = float(df_main["close"].iloc[-2])  # dùng nến đã đóng
         atrval = atr(df_main, 14)
         swing_hi, swing_lo = swing_levels(df_main, 20)
+
         # hệ số ATR theo loại sản phẩm (giữ quy ước cũ)
         base_mult = 2.5 if is_fx(symbol) or is_fx(name) else 1.5
+
         # (NEW) sideway filter: nếu sideway_block → KHÔNG đề xuất lệnh
         if sideway_block:
             plan = "SIDEWAY"
@@ -1152,15 +1155,11 @@ def analyze_symbol(name, symbol, daily_cache):
                     cap = max(0.8 * atrval, entry - (swing_lo - 0.4 * atrval))
                 tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
                 tp = entry - tp_dist
-                
         # … sau khi đã có entry/sl/tp …
         if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-
-        # === ENTRY WINDOW (reset theo nến đã ĐÓNG của TF chính) ===
-                
         # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
         # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
         reasons = []
@@ -1357,4 +1356,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
