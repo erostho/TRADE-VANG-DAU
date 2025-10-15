@@ -1118,7 +1118,6 @@ def analyze_symbol(name, symbol, daily_cache):
     save_state(state)
 
     # ===== Entry/SL/TP (GIỮ NGUYÊN cấu trúc cũ của bạn) =====
-    # ===== Entry/SL/TP (ĐÃ GỠ ENTRY WINDOW) =====
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
     lots = 0.0
@@ -1181,43 +1180,61 @@ def analyze_symbol(name, symbol, daily_cache):
 
         # ====== 5 FILTER NÂNG WINRATE ======
         reasons = []
-
         # 4H bias phải trùng hướng trade
+        # ---- Soft filters: chấm điểm thay vì chặn cứng ----
+        score_ok = 0
+        why = []
+        
+        # 4H bias cùng hướng
         bias4 = _norm_dir(results.get("4H", "N/A"))
-        if final_dir in ("LONG","SHORT") and bias4 in ("LONG","SHORT") and bias4 != final_dir:
-            reasons.append("4H bias mismatch")
-
-        # RSI + MACD phải cùng hướng với final_dir
+        if final_dir in ("LONG","SHORT") and bias4 == final_dir:
+            score_ok += 1
+        else:
+            why.append("4H bias mismatch")
+        
+        # RSI & MACD
         try:
             rsi_last = rsi(df_main["close"], 14).iloc[-2]
             macd_h   = macd_hist(df_main["close"])
-            if final_dir == "LONG"  and (rsi_last < 55 or macd_h <= 0): reasons.append("RSI/MACD not aligned")
-            if final_dir == "SHORT" and (rsi_last > 45 or macd_h >= 0): reasons.append("RSI/MACD not aligned")
+            rsi_ok   = (final_dir == "LONG"  and rsi_last >= 50) or (final_dir == "SHORT" and rsi_last <= 50)
+            macd_ok  = (final_dir == "LONG"  and macd_h > 0)     or (final_dir == "SHORT" and macd_h < 0)
+            if rsi_ok and macd_ok:
+                score_ok += 1
+            else:
+                why.append("RSI/MACD not aligned")
         except Exception:
             pass
-
-        # Volume xác nhận
-        if not has_volume_spike(df_main, n=20, mult=1.2):
-            reasons.append("No volume confirmation")
-
-        # Price Action: Engulfing / Pin bar
+        
+        # Price Action (engulfing/pin) – chỉ cộng điểm nếu có, KHÔNG chặn cứng
         bull_ok = is_bullish_engulfing(df_main) or is_bullish_pinbar(df_main)
         bear_ok = is_bearish_engulfing(df_main) or is_bearish_pinbar(df_main)
-        if final_dir == "LONG"  and not bull_ok:  reasons.append("No bullish PA (engulf/pin)")
-        if final_dir == "SHORT" and not bear_ok:  reasons.append("No bearish PA (engulf/pin)")
-
-        # RR < 1.8 thì bỏ
+        pa_ok = (final_dir == "LONG" and bull_ok) or (final_dir == "SHORT" and bear_ok)
+        if pa_ok:
+            score_ok += 1
+        else:
+            why.append("No supportive PA")
+        
+        # Volume – bỏ qua nếu không có cột hoặc dữ liệu kém
+        vol_ok = has_volume_spike(df_main, n=20, mult=float(os.getenv("VOL_SPIKE_MULT","1.05")))
+        if vol_ok:
+            score_ok += 1
+        else:
+            why.append("No volume confirmation")
+        
+        # RR tối thiểu theo độ mạnh tín hiệu
+        rr_min = 1.3 if (final_conf >= 80 and bias4 == final_dir) else (1.5 if final_conf >= 70 else 1.8)
         if entry is not None and sl is not None and tp is not None:
             rr_ratio = abs(tp - entry) / max(1e-9, abs(entry - sl))
-            if rr_ratio < 1.8:
-                reasons.append(f"RR too low ({rr_ratio:.2f} < 1.8)")
-
-        # Nếu có bất kỳ lý do nào thì hủy
-        if reasons:
-            plan = "SIDEWAY"
-            entry = sl = tp = None
-            lots = 0.0
-            block_reason = " | ".join(reasons)
+            if rr_ratio >= rr_min:
+                score_ok += 1
+            else:
+                why.append(f"RR too low ({rr_ratio:.2f} < {rr_min})")
+        
+        # Ngưỡng đỗ: yêu cầu ít nhất 2 điều kiện (tuỳ chỉnh bằng env)
+        need = int(os.getenv("FILTER_PASS_MIN","2"))
+        if score_ok < need:
+            plan = "SIDEWAY"; entry = sl = tp = None; lots = 0.0
+            block_reason = " | ".join(why) if why else "Filters not passed"
 
         # ==== GUARDS ====
         if entry is not None and sl is not None and tp is not None:
