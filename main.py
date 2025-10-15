@@ -115,30 +115,31 @@ VOL_ATR_MULT  = float(os.getenv("VOL_ATR_MULT", "1.25"))  # ATR hiện tại > 1
 # Bias tracking
 BIAS_INVALIDATE_MIN = int(os.getenv("BIAS_INVALIDATE_MIN", "60"))  # 60' sau tín hiệu nếu mất bias thì huỷ
 # ================ HELPERS ================
-def fetch_candles(symbol, interval, retries=3):
+# cache 1 lần chạy
+RUN_CACHE = {}
+def fetch_candles(symbol, interval, retries=3, use_cache=True):
     key = (symbol, interval)
-    if key in RUN_CACHE:
+    if use_cache and key in RUN_CACHE:
         return RUN_CACHE[key]
 
     url = f"{BASE_URL}?symbol={symbol}&interval={interval}&apikey={API_KEY}&outputsize=200"
     for attempt in range(retries):
         try:
-            _throttle()  # GIỮA MỌI LẦN GỌI
+            _throttle()
             r = requests.get(url, timeout=10)
             if r.status_code == 429:
                 logging.warning(f"429 {symbol}-{interval} -> sleep 65s & retry...")
-                time.sleep(65)
-                continue
+                time.sleep(65); continue
             data = r.json()
             if "values" not in data:
                 logging.warning(f"No data for {symbol}-{interval}: {data}")
                 return None
             df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
+            df["datetime"] = pd.to_datetime(df["datetime"], utc=True)  # BẮT BUỘC UTC
             df = df.sort_values("datetime").reset_index(drop=True)
-            for col in ["open", "high", "low", "close"]:
+            for col in ["open","high","low","close"]:
                 df[col] = pd.to_numeric(df[col])
-            RUN_CACHE[key] = df  # lưu cache cho cùng lần chạy
+            RUN_CACHE[key] = df
             return df
         except Exception as e:
             logging.error(f"Fetch error {symbol}-{interval}: {e}")
@@ -997,6 +998,17 @@ def is_bearish_pinbar(df, tol=0.33):
     upper_tail = h - max(o,c)
     body = abs(c - o)
     return (c < o) and (upper_tail / rng >= tol) and (body / rng <= 1 - tol)
+
+def tf_to_timedelta(tf: str) -> timedelta:
+    tf = tf.lower()
+    if tf.endswith("min"):
+        return timedelta(minutes=int(tf.replace("min","")))
+    if tf.endswith("h"):
+        return timedelta(hours=int(tf.replace("h","")))
+    if tf in ("1day","1d","day"):
+        return timedelta(days=1)
+    # mặc định 2h
+    return timedelta(hours=2)
 # ================ CORE ANALYZE ================
 def analyze_symbol(name, symbol, daily_cache):
     results = {}
@@ -1109,17 +1121,38 @@ def analyze_symbol(name, symbol, daily_cache):
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
     lots = 0.0
-
-    MAIN_TF = os.getenv("MAIN_TF", "2h")  # giữ env như bạn đang dùng
-    df_main = fetch_candles(symbol, MAIN_TF)
-
+    MAIN_TF = os.getenv("MAIN_TF", "2h")           # TF chính
+    df_main = fetch_candles(symbol, MAIN_TF, use_cache=False)   # <== KHÔNG dùng cache
+    
     if df_main is not None and len(df_main) > 60:
-        entry  = float(df_main["close"].iloc[-2])  # dùng nến đã đóng
-        atrval = atr(df_main, 14)
-        swing_hi, swing_lo = swing_levels(df_main, 20)
-
-        # hệ số ATR theo loại sản phẩm (giữ quy ước cũ)
-        base_mult = 2.5 if is_fx(symbol) or is_fx(name) else 1.5
+        # đảm bảo cột datetime là UTC
+        if df_main["datetime"].dt.tz is None:
+            df_main["datetime"] = pd.to_datetime(df_main["datetime"], utc=True)
+    
+        # --- ENTRY WINDOW: dựa trên cây nến đã đóng cuối cùng (close[-2]) ---
+        last_closed_ts = pd.to_datetime(df_main["datetime"].iloc[-2])
+        if last_closed_ts.tzinfo is None:
+            last_closed_ts = last_closed_ts.tz_localize("UTC")
+        now_utc       = datetime.now(timezone.utc)
+    
+        # helper đổi TF -> timedelta (đặt ở trên file 1 lần)
+        # def tf_to_timedelta(tf): ...  (như mình gửi trước)
+    
+        next_close_ts = last_closed_ts + tf_to_timedelta(MAIN_TF)
+        if now_utc >= next_close_ts:
+            # đã sang nến mới => không dùng entry/SL/TP cũ nữa
+            plan = "SIDEWAY"
+            entry = sl = tp = atrval = None
+            block_reason = f"Entry window expired ({int((now_utc-last_closed_ts).total_seconds()/60)}’)"
+        else:
+            # --- tính entry/ATR/swing như cũ, NHƯNG lấy close[-2] ---
+            entry   = float(df_main["close"].iloc[-2])      # nến đã đóng
+            atrval  = atr(df_main, 14)
+            swing_hi, swing_lo = swing_levels(df_main, 20)
+    
+            # hệ số ATR theo loại sản phẩm (giữ nguyên logic cũ)
+            base_mult = 2.5 if (is_fx(symbol) or is_fx(name)) else 1.5
+            # (giữ nguyên phần tính SL/TP phía dưới của bạn)
 
         # (NEW) sideway filter: nếu sideway_block → KHÔNG đề xuất lệnh
         if sideway_block:
@@ -1303,6 +1336,7 @@ def send_telegram(msg):
 def main():
     # luôn kiểm tra/làm mới cache 1D (chỉ fetch khi tới giờ/đúng ngày)
     daily_cache = maybe_refresh_daily_cache()
+    RUN_CACHE.clear()  # đảm bảo nến mới được tải
     # === Hiệu chuẩn dầu tự động (nếu có ticker bên Exness) ===
     global _OIL_SCALE, _OIL_OFFSET
     _OIL_SCALE, _OIL_OFFSET = compute_oil_calibration()
