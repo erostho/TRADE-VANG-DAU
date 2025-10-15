@@ -1148,14 +1148,15 @@ def analyze_symbol(name, symbol, daily_cache):
                     entry - base_mult * atrval,
                     (swing_lo - 0.3 * atrval) if not np.isnan(swing_lo) else entry - base_mult * atrval
                 ]
-                sl = min(sl_candidates)
-                R = entry - sl
-                rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
-                cap = None
-                if not np.isnan(swing_hi):
-                    cap = max(0.8 * atrval, (swing_hi + 0.4 * atrval) - entry)
-                tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
-                tp = entry + tp_dist
+                # ---- Smart SL/TP tự động theo ATR + Keltner + Swing ----
+                try:
+                    k_mid, kup, kdn = keltner_mid(df_main, 20, atr_mult=1.0)
+                    sl, tp = smart_sl_tp(
+                        entry, atrval, swing_hi, swing_lo, kup, kdn, final_dir,
+                        is_fx(symbol) or is_fx(name)
+                    )
+                except Exception as e:
+                    logging.warning(f"⚠️ smart_sl_tp fallback: {e}")
 
             elif final_dir == "SHORT" and final_conf >= CONF_THRESHOLD:
                 plan = "SHORT"
@@ -1163,14 +1164,15 @@ def analyze_symbol(name, symbol, daily_cache):
                     entry + base_mult * atrval,
                     (swing_hi + 0.3 * atrval) if not np.isnan(swing_hi) else entry + base_mult * atrval
                 ]
-                sl = max(sl_candidates)
-                R = sl - entry
-                rr_tp = min(max(1.2 * R, 1.5 * atrval), 3.0 * atrval)
-                cap = None
-                if not np.isnan(swing_lo):
-                    cap = max(0.8 * atrval, entry - (swing_lo - 0.4 * atrval))
-                tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
-                tp = entry - tp_dist
+                # ---- Smart SL/TP tự động theo ATR + Keltner + Swing ----
+                try:
+                    k_mid, kup, kdn = keltner_mid(df_main, 20, atr_mult=1.0)
+                    sl, tp = smart_sl_tp(
+                        entry, atrval, swing_hi, swing_lo, kup, kdn, final_dir,
+                        is_fx(symbol) or is_fx(name)
+                    )
+                except Exception as e:
+                    logging.warning(f"⚠️ smart_sl_tp fallback: {e}")
 
         # === Nếu là dầu thì hiệu chỉnh giá ===
         if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
