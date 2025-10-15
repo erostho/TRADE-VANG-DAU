@@ -1160,21 +1160,32 @@ def analyze_symbol(name, symbol, daily_cache):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-        # === ENTRY WINDOW: auto reset khi có nến mới (không chặn tín hiệu) ===
+        # === ENTRY WINDOW: reset khi đã sang nến CHÍNH mới (dựa đúng timestamp của df_main) ===
         try:
-            last_closed_ts = pd.to_datetime(df_main["datetime"].iloc[-2]).to_pydatetime()
-            tf_minutes_map = {"15min":15,"30min":30,"1h":60,"2h":120,"4h":240}
+            # Lấy timestamp của nến đã ĐÓNG dùng cho entry (phải là index -2)
+            last_closed_ts = pd.to_datetime(df_main["datetime"].iloc[-2], utc=True).to_pydatetime()
+            # Bảo đảm có tzinfo (UTC)
+            if last_closed_ts.tzinfo is None:
+                last_closed_ts = last_closed_ts.replace(tzinfo=timezone.utc)
+        
+            # Suy ra độ dài khung MAIN_TF
+            tf_minutes_map = {"15min": 15, "30min": 30, "1h": 60, "2h": 120, "4h": 240}
             tf_minutes = tf_minutes_map.get(MAIN_TF, 120)
+        
             next_candle_ts = last_closed_ts + timedelta(minutes=tf_minutes)
         
-            now = datetime.now(timezone.utc)
-            # Nếu thời điểm hiện tại nằm trước nến tiếp theo -> cho phép tín hiệu
-            # Nếu đã qua nến mới -> reset lại entry cho phù hợp
-            if now >= next_candle_ts:
+            now_utc = datetime.now(timezone.utc)
+        
+            # Nếu đã qua thời điểm mở nến kế tiếp -> reset tín hiệu để chờ setup mới
+            if now_utc >= next_candle_ts:
                 entry = sl = tp = None
                 plan = "SIDEWAY"
+                # (tùy chọn) ghi log nhẹ để theo dõi
+                logging.info(f"[ENTRY] reset: last_closed={last_closed_ts.isoformat()} "
+                             f"next={next_candle_ts.isoformat()} now={now_utc.isoformat()}")
         except Exception as e:
-            print(f"[WARN] ENTRY WINDOW check failed: {e}")
+            logging.warning(f"[WARN] ENTRY WINDOW check failed: {e}")
+            # Không chặn tín hiệu nếu check lỗi
             pass
         # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
         # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
