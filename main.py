@@ -104,7 +104,7 @@ NEWS_CACHE_PATH      = os.getenv("NEWS_CACHE_PATH", "/tmp/news_today.json")
 SIGNAL_CSV_PATH      = os.getenv("SIGNAL_CSV_PATH", "/tmp/signals.csv")
 # ===== INTRABAR GUARDS (real-time adaptation) =====
 INTRABAR_PRICE_DEVIATION_ATR = float(os.getenv("INTRABAR_DEV_ATR", "0.5"))  # lệch > 0.5*ATR -> bỏ tín hiệu
-#ENTRY_WINDOW_MIN             = 80
+ENTRY_WINDOW_MIN             = 80
 MICROTREND_TF                 = os.getenv("MICROTREND_TF", "15min")          # khung xác nhận micro
 MICROTREND_ALLOW_SIDEWAY      = os.getenv("MICROTREND_ALLOW_SIDEWAY", "1") == "1"
 
