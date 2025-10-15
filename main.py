@@ -1158,8 +1158,23 @@ def analyze_symbol(name, symbol, daily_cache):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-            
-        #ENTRY WINDOW
+
+        # === ENTRY WINDOW: chỉ hợp lệ trong N phút kể từ nến CHÍNH (ví dụ 2H) đã ĐÓNG ===
+        try:
+            # nến đã ĐÓNG dùng làm entry (khớp với close[-2])
+            last_closed_ts = pd.to_datetime(df_main["datetime"].iloc[-2]).to_pydatetime()
+        
+            # phút đã trôi qua kể từ nến đó
+            age_min = (datetime.now(timezone.utc) - last_closed_ts.replace(tzinfo=timezone.utc)).total_seconds() / 60.0
+        
+            if age_min > ENTRY_WINDOW_MIN:
+                # quá cửa sổ vào lệnh -> không xuất entry/sl/tp, chỉ báo lý do
+                plan = "SIDEWAY"
+                entry = sl = tp = None
+                block_reason = f"Entry window expired ({int(age_min)}’)"
+        except Exception:
+            # nếu có lỗi dữ liệu thời gian thì bỏ qua guard này
+            pass
         
         # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
         # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
