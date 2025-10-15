@@ -1334,18 +1334,19 @@ def main():
         time.sleep(10)
 
     # Nếu tất cả đều N/A/SIDEWAY & không có Entry -> vẫn gửi để biết trạng thái; nếu muốn có thể chặn tại đây
-    #msg = "\n".join(lines)
-    #send_telegram(msg)
+    msg = "\n".join(lines)
+    send_telegram(msg)
+    
     # Chỉ gửi nếu có ít nhất 1 symbol có Entry thật (không phải N/A)
-    valid_msg = any(
-    ("Entry" in l and not any(x in l for x in ["N/A", "None", "NaN"]))
-    for l in lines
-)
-    if valid_msg:
-        msg = "\n".join(lines)
-        send_telegram(msg)
-    else:
-        print("🚫 Tất cả đều N/A, không gửi Telegram")
+    #valid_msg = any(
+    #("Entry" in l and not any(x in l for x in ["N/A", "None", "NaN"]))
+    #for l in lines
+#)
+    #if valid_msg:
+        #msg = "\n".join(lines)
+        #send_telegram(msg)
+    #else:
+        #print("🚫 Tất cả đều N/A, không gửi Telegram")
 
 if __name__ == "__main__":
     main()
