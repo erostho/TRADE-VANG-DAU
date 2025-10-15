@@ -1160,35 +1160,7 @@ def analyze_symbol(name, symbol, daily_cache):
             tp    = oil_adjust(tp)
 
         # === ENTRY WINDOW (reset theo nến đã ĐÓNG của TF chính) ===
-        try:
-            # 1) ép datetime của df_main về UTC và lấy nến đã đóng
-            df_main["datetime"] = pd.to_datetime(df_main["datetime"], utc=True)
-            last_closed_ts = df_main["datetime"].iloc[-2].to_pydatetime()  # bar close time (UTC)
-        
-            # 2) now cũng ở UTC
-            now = datetime.now(timezone.utc)
-        
-            # 3) tính thời điểm đóng nến kế tiếp (để biết còn trong cùng bar hay đã sang bar mới)
-            tf_minutes_map = {"15min": 15, "30min": 30, "1h": 60, "2h": 120, "4h": 240}
-            tf_minutes = tf_minutes_map.get(MAIN_TF, 120)
-            next_close_ts = last_closed_ts + timedelta(minutes=tf_minutes)
-        
-            # 4) chỉ chặn nếu vẫn còn nằm TRONG cùng bar và đã quá cửa sổ nhập lệnh
-            if now < next_close_ts:
-                mins_since = int((now - last_closed_ts).total_seconds() // 60)
-                if mins_since > ENTRY_WINDOW_MIN:
-                    plan = "SIDEWAY"
-                    entry = sl = tp = None
-                    # gộp reason nếu đã có
-                    try:
-                        block_reason = (block_reason + " | " if block_reason else "") + f"Entry window expired ({mins_since}’)"
-                    except NameError:
-                        block_reason = f"Entry window expired ({mins_since}’)"
-            # Nếu now >= next_close_ts → đã sang bar mới, window tự reset (không chặn)
-        except Exception as e:
-            logging.warning(f"ENTRY WINDOW guard skipped: {e}")
-       
-        
+                
         # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
         # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
         reasons = []
