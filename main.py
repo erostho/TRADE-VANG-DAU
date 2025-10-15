@@ -1118,43 +1118,27 @@ def analyze_symbol(name, symbol, daily_cache):
     save_state(state)
 
     # ===== Entry/SL/TP (GIỮ NGUYÊN cấu trúc cũ của bạn) =====
+    # ===== Entry/SL/TP (ĐÃ GỠ ENTRY WINDOW) =====
     plan = "SIDEWAY"
     entry = sl = tp = atrval = None
     lots = 0.0
     MAIN_TF = os.getenv("MAIN_TF", "2h")           # TF chính
-    df_main = fetch_candles(symbol, MAIN_TF, use_cache=False)   # <== KHÔNG dùng cache
+    df_main = fetch_candles(symbol, MAIN_TF, use_cache=False)   # luôn lấy nến mới
     
     if df_main is not None and len(df_main) > 60:
-        # đảm bảo cột datetime là UTC
+        # đảm bảo datetime là UTC
         if df_main["datetime"].dt.tz is None:
             df_main["datetime"] = pd.to_datetime(df_main["datetime"], utc=True)
-    
-        # --- ENTRY WINDOW: dựa trên cây nến đã đóng cuối cùng (close[-2]) ---
-        last_closed_ts = pd.to_datetime(df_main["datetime"].iloc[-2])
-        if last_closed_ts.tzinfo is None:
-            last_closed_ts = last_closed_ts.tz_localize("UTC")
-        now_utc       = datetime.now(timezone.utc)
-    
-        # helper đổi TF -> timedelta (đặt ở trên file 1 lần)
-        # def tf_to_timedelta(tf): ...  (như mình gửi trước)
-    
-        next_close_ts = last_closed_ts + tf_to_timedelta(MAIN_TF)
-        if now_utc >= next_close_ts:
-            # đã sang nến mới => không dùng entry/SL/TP cũ nữa
-            plan = "SIDEWAY"
-            entry = sl = tp = atrval = None
-            block_reason = f"Entry window expired ({int((now_utc-last_closed_ts).total_seconds()/60)}’)"
-        else:
-            # --- tính entry/ATR/swing như cũ, NHƯNG lấy close[-2] ---
-            entry   = float(df_main["close"].iloc[-2])      # nến đã đóng
-            atrval  = atr(df_main, 14)
-            swing_hi, swing_lo = swing_levels(df_main, 20)
-    
-            # hệ số ATR theo loại sản phẩm (giữ nguyên logic cũ)
-            base_mult = 2.5 if (is_fx(symbol) or is_fx(name)) else 1.5
-            # (giữ nguyên phần tính SL/TP phía dưới của bạn)
 
-        # (NEW) sideway filter: nếu sideway_block → KHÔNG đề xuất lệnh
+        # --- tính entry/ATR/swing như cũ, dùng nến đã đóng (-2) ---
+        entry   = float(df_main["close"].iloc[-2])
+        atrval  = atr(df_main, 14)
+        swing_hi, swing_lo = swing_levels(df_main, 20)
+
+        # hệ số ATR theo loại sản phẩm
+        base_mult = 2.5 if (is_fx(symbol) or is_fx(name)) else 1.5
+
+        # sideway filter
         if sideway_block:
             plan = "SIDEWAY"
             entry = sl = tp = None
@@ -1188,40 +1172,14 @@ def analyze_symbol(name, symbol, daily_cache):
                     cap = max(0.8 * atrval, entry - (swing_lo - 0.4 * atrval))
                 tp_dist = min(rr_tp, cap) if (cap is not None and cap > 0) else rr_tp
                 tp = entry - tp_dist
-        # … sau khi đã có entry/sl/tp …
+
+        # === Nếu là dầu thì hiệu chỉnh giá ===
         if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-        # === ENTRY WINDOW: reset khi đã sang nến CHÍNH mới (dựa đúng timestamp của df_main) ===
-        try:
-            # Lấy timestamp của nến đã ĐÓNG dùng cho entry (phải là index -2)
-            last_closed_ts = pd.to_datetime(df_main["datetime"].iloc[-2], utc=True).to_pydatetime()
-            # Bảo đảm có tzinfo (UTC)
-            if last_closed_ts.tzinfo is None:
-                last_closed_ts = last_closed_ts.replace(tzinfo=timezone.utc)
-        
-            # Suy ra độ dài khung MAIN_TF
-            tf_minutes_map = {"15min": 15, "30min": 30, "1h": 60, "2h": 120, "4h": 240}
-            tf_minutes = tf_minutes_map.get(MAIN_TF, 120)
-        
-            next_candle_ts = last_closed_ts + timedelta(minutes=tf_minutes)
-        
-            now_utc = datetime.now(timezone.utc)
-        
-            # Nếu đã qua thời điểm mở nến kế tiếp -> reset tín hiệu để chờ setup mới
-            if now_utc >= next_candle_ts:
-                entry = sl = tp = None
-                plan = "SIDEWAY"
-                # (tùy chọn) ghi log nhẹ để theo dõi
-                logging.info(f"[ENTRY] reset: last_closed={last_closed_ts.isoformat()} "
-                             f"next={next_candle_ts.isoformat()} now={now_utc.isoformat()}")
-        except Exception as e:
-            logging.warning(f"[WARN] ENTRY WINDOW check failed: {e}")
-            # Không chặn tín hiệu nếu check lỗi
-            pass
-        # ====== 5 FILTER NÂNG WINRATE (thêm ngay sau khi đã có entry/sl/tp) ======
-        # Gom lý do chặn vào block_reason (nếu đã có sẵn thì nối thêm)
+
+        # ====== 5 FILTER NÂNG WINRATE ======
         reasons = []
 
         # 4H bias phải trùng hướng trade
@@ -1229,93 +1187,67 @@ def analyze_symbol(name, symbol, daily_cache):
         if final_dir in ("LONG","SHORT") and bias4 in ("LONG","SHORT") and bias4 != final_dir:
             reasons.append("4H bias mismatch")
 
-        # RSI + MACD phải cùng hướng với final_dir (nến đã đóng)
+        # RSI + MACD phải cùng hướng với final_dir
         try:
             rsi_last = rsi(df_main["close"], 14).iloc[-2]
             macd_h   = macd_hist(df_main["close"])
             if final_dir == "LONG"  and (rsi_last < 55 or macd_h <= 0): reasons.append("RSI/MACD not aligned")
             if final_dir == "SHORT" and (rsi_last > 45 or macd_h >= 0): reasons.append("RSI/MACD not aligned")
         except Exception:
-            pass  # nếu lỗi chỉ báo thì không chặn
+            pass
 
-        # Volume spike xác nhận (nếu có cột volume)
+        # Volume xác nhận
         if not has_volume_spike(df_main, n=20, mult=1.2):
             reasons.append("No volume confirmation")
 
-        # Price Action: Engulfing / Pin bar theo hướng
+        # Price Action: Engulfing / Pin bar
         bull_ok = is_bullish_engulfing(df_main) or is_bullish_pinbar(df_main)
         bear_ok = is_bearish_engulfing(df_main) or is_bearish_pinbar(df_main)
         if final_dir == "LONG"  and not bull_ok:  reasons.append("No bullish PA (engulf/pin)")
         if final_dir == "SHORT" and not bear_ok:  reasons.append("No bearish PA (engulf/pin)")
 
-        # RR phải đạt tối thiểu 1.8
+        # RR < 1.8 thì bỏ
         if entry is not None and sl is not None and tp is not None:
             rr_ratio = abs(tp - entry) / max(1e-9, abs(entry - sl))
             if rr_ratio < 1.8:
                 reasons.append(f"RR too low ({rr_ratio:.2f} < 1.8)")
 
-        # Nếu có bất kỳ lý do -> huỷ đề xuất lệnh, ghi reason
+        # Nếu có bất kỳ lý do nào thì hủy
         if reasons:
             plan = "SIDEWAY"
             entry = sl = tp = None
             lots = 0.0
-            # nếu bạn đã có biến block_reason trước đó:
-            try:
-                if block_reason:
-                    block_reason = block_reason + " | " + " | ".join(reasons)
-                else:
-                    block_reason = " | ".join(reasons)
-            except NameError:
-                block_reason = " | ".join(reasons)
-        # ==== (NEW) 5 GUARDS chống “đảo chiều giữa nến” ====        
-        # 1) Dynamic candle validation: giá hiện tại lệch quá xa Entry -> bỏ
+            block_reason = " | ".join(reasons)
+
+        # ==== GUARDS ====
         if entry is not None and sl is not None and tp is not None:
             px_now = get_realtime_price(symbol)
             if px_now is not None and abs(px_now - entry) > INTRABAR_PRICE_DEVIATION_ATR * atrval:
-                plan = "SIDEWAY"; entry = sl = tp = None
-                block_reason = f"Price deviated > {INTRABAR_PRICE_DEVIATION_ATR}×ATR"
+                plan = "SIDEWAY"; entry = sl = tp = None; block_reason = f"Price deviated > {INTRABAR_PRICE_DEVIATION_ATR}×ATR"
 
-        # 2) Micro-trend confirmation (15m cùng hướng hoặc ít nhất không ngược)
         if entry is not None and sl is not None and tp is not None:
             if not micro_trend_ok(symbol, final_dir):
-                plan = "SIDEWAY"; entry = sl = tp = None
-                block_reason = f"Micro-trend {MICROTREND_TF} disagrees"
+                plan = "SIDEWAY"; entry = sl = tp = None; block_reason = f"Micro-trend {MICROTREND_TF} disagrees"
 
-        # 3) Adaptive volatility regime: biến động cao thì bắt buộc micro-confirm chặt hơn
         if entry is not None and sl is not None and tp is not None and is_high_vol(symbol):
-            # Trong chế độ high-vol chỉ cho đi khi micro-trend đúng hướng KÈM khoảng lệch rất nhỏ
             px_now = px_now if 'px_now' in locals() and px_now is not None else get_realtime_price(symbol)
             if (not micro_trend_ok(symbol, final_dir)) or (px_now is not None and abs(px_now - entry) > 0.3 * atrval):
-                plan = "SIDEWAY"; entry = sl = tp = None
-                block_reason = "High-volatility guard"
+                plan = "SIDEWAY"; entry = sl = tp = None; block_reason = "High-volatility guard"
 
-        # 4) Real-time bias tracking: nếu bias bị vô hiệu trong ~1h -> bỏ
         if entry is not None and sl is not None and tp is not None:
             if bias_invalidation(symbol, final_dir):
-                plan = "SIDEWAY"; entry = sl = tp = None
-                block_reason = "Bias invalidated intrabar"
+                plan = "SIDEWAY"; entry = sl = tp = None; block_reason = "Bias invalidated intrabar"
 
-        # 5) (giữ nguyên) — nếu tên là dầu WTI thì hiệu chỉnh sang quote Exness
-        if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
-            entry = oil_adjust(entry); sl = oil_adjust(sl); tp = oil_adjust(tp)
-        # (NEW) Position sizing — chỉ khi có SL/TP hợp lệ
+        # === Position sizing ===
         if entry is not None and sl is not None and tp is not None:
-            lots = compute_lot_size(entry, sl, symbol, name)
-        if entry is not None and sl is not None and tp is not None and not block_reason:
             rpct = dynamic_risk_pct(final_conf, regime)
             lots = compute_lot_size(entry, sl, symbol, name, risk_pct=rpct)
-        
-            est_risk_money = account_equity_usd()*rpct
-            # --- New: Daily risk cap based on *actual open trades* ---
             open_risk_money = fetch_open_positions_risk()
             day_cap_money   = account_equity_usd() * DAILY_RISK_CAP_PCT
-            
             if open_risk_money + (account_equity_usd() * rpct) > day_cap_money:
-                plan = "SIDEWAY"
-                entry = sl = tp = None
+                plan = "SIDEWAY"; entry = sl = tp = None
                 block_reason = f"Daily risk cap reached ({int(DAILY_RISK_CAP_PCT*100)}%)"
             else:
-                # Không cộng risk_used nữa (vì chỉ tính lệnh thực)
                 log_signal(name, plan, entry, sl, tp, final_conf, regime, lots)
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots, block_reason
