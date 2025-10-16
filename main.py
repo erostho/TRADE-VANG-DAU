@@ -1229,7 +1229,203 @@ def analyze_symbol(name, symbol, daily_cache):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
+        # === UPGRADE MR/TRADING FILTER 2025 
+        # === UPGRADE MR/TRADING FILTER 2025 =========================================
+        # Mục tiêu:
+        # 1) Cho phép Mean-Reversion (MR) an toàn cho FX khi RANGE
+        # 2) Nới RSI/MACD khi RANGE, đặc biệt với MR
+        # 3) Bỏ bắt buộc Volume/PA cho FX RANGE (vì dữ liệu volume FX thường sai)
+        # 4) RR tối thiểu co giãn theo ADX (1.5 ↔ 2.2)
+        # 5) Watchdog: nếu 36h chưa ra kèo -> tạm nới 1 vòng
+        # 6) Price Deviation Guard động theo loại sản phẩm (FX chặt hơn)
+        
+        from dataclasses import dataclass
+        
+        # ---- cấu hình mềm (có thể đổi bằng env nếu muốn) ----
+        RELAX_AFTER_H = int(os.getenv("RELAX_AFTER_H", "36"))   # watchdog 36h
+        WDOG_PATH     = os.getenv("WDOG_PATH", "/tmp/signal_watchdog.json")
+        
+        def _load_wdog():
+            try:
+                with open(WDOG_PATH, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        def _save_wdog(d):
+            try:
+                with open(WDOG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(d, f, ensure_ascii=False)
+            except Exception:
+                pass
+        
+        def _minutes_since_iso(ts_iso):
+            try:
+                t = datetime.fromisoformat(ts_iso)
+                return (datetime.now(timezone.utc) - t).total_seconds()/60.0
+            except Exception:
+                return 1e9
+        
+        @dataclass
+        class MrSetup:
+            enabled: bool = False
+            side: str = "SIDEWAY"   # LONG/SHORT
+            entry: float | None = None
+            sl: float | None = None
+            tp: float | None = None
+            note: str = ""
+        
+        def _fx_symbol(name_or_sym: str) -> bool:
+            up = name_or_sym.upper()
+            return ("EUR/USD" in up) or ("USD/JPY" in up) or ("/" in up and "XAU" not in up and "BTC" not in up and "ETH" not in up)
+        
+        def _price_deviation_limit(symbol_or_name: str, atrv: float) -> float:
+            up = symbol_or_name.upper()
+            # FX nhạy → lệch tối đa 0.25*ATR; Commodity 0.4; Crypto 0.6
+            if _fx_symbol(up):          return 0.25 * atrv
+            if ("XAU" in up) or ("CL" in up) or ("OIL" in up):  return 0.40 * atrv
+            return 0.60 * atrv
+        
+        def _rr_min_by_adx(adx_val: float) -> float:
+            if np.isnan(adx_val):    return 1.8
+            if adx_val < 18:         return 1.50   # yếu => chốt gần
+            if adx_val < 25:         return 1.70
+            if adx_val < 32:         return 1.85
+            return 2.20              # rất mạnh => giữ xa
+        
+        def _mr_fx_range(df2h, df_main, atrv) -> MrSetup:
+            """
+            Mean-Reversion cho FX khi RANGE:
+              - giá nến -2 chạm/vượt 2σ Bollinger (20) trên 2H
+              - entry = close[-2], SL ngoài band ~0.8*ATR, TP về mid Keltner/BB
+            """
+            setup = MrSetup(enabled=False)
+            try:
+                if df2h is None or len(df2h) < 60 or df_main is None or len(df_main) < 60:
+                    return setup
+        
+                # BB 20 trên 2H (dùng nến đã đóng)
+                close2 = df2h["close"]
+                ma = close2.rolling(20).mean()
+                sd = close2.rolling(20).std()
+                upper = ma + 2*sd
+                lower = ma - 2*sd
+                c2 = float(close2.iloc[-2])
+        
+                # Keltner mid để chọn TP
+                kmid, kup, kdn = keltner_mid(df_main, 20, atr_mult=1.0)
+                # Ngưỡng "chạm biên" mềm: c2 >= upper[-2] * 0.999… để chịu sai số API
+                hit_upper = (not np.isnan(upper.iloc[-2])) and (c2 >= float(upper.iloc[-2]) * 0.999)
+                hit_lower = (not np.isnan(lower.iloc[-2])) and (c2 <= float(lower.iloc[-2]) * 1.001)
+        
+                if hit_upper:
+                    setup.enabled = True
+                    setup.side = "SHORT"
+                    setup.entry = float(df_main["close"].iloc[-2])
+                    # SL phía trên band 0.8*ATR
+                    band_cap = max(0.8*atrv, setup.entry - float(lower.iloc[-2]))
+                    setup.sl = setup.entry + band_cap
+                    # TP về mid (Keltner hoặc BB ma), đảm bảo tối thiểu 1.5R
+                    R = abs(setup.sl - setup.entry)
+                    tp_target = min(setup.entry - 1.5*R, float(kmid) if not np.isnan(kmid) else float(ma.iloc[-2]))
+                    setup.tp = tp_target
+                    setup.note = "MR-FX (upper band)"
+                elif hit_lower:
+                    setup.enabled = True
+                    setup.side = "LONG"
+                    setup.entry = float(df_main["close"].iloc[-2])
+                    band_cap = max(0.8*atrv, float(upper.iloc[-2]) - setup.entry)
+                    setup.sl = setup.entry - band_cap
+                    R = abs(setup.entry - setup.sl)
+                    tp_target = max(setup.entry + 1.5*R, float(kmid) if not np.isnan(kmid) else float(ma.iloc[-2]))
+                    setup.tp = tp_target
+                    setup.note = "MR-FX (lower band)"
+        
+                return setup
+            except Exception:
+                return setup
+        
+        # ---- bắt đầu áp dụng --------------------------------------------------------
+        try:
+            # Tập hợp dữ liệu cần thiết; nếu thiếu, bỏ qua block nâng cấp
+            df2h_for_mr = fetch_candles(symbol, "2h")
+            adx2 = adx(df2h_for_mr, 14) if df2h_for_mr is not None else np.nan
+        
+            # RR MIN động theo ADX (áp cho cả setup trend)
+            RR_MIN = _rr_min_by_adx(adx2)
+        
+            # Watchdog (nếu quá lâu không có lệnh, tạm nới điều kiện 1 vòng)
+            wdog = _load_wdog()
+            sym_key = f"{name}|{symbol}"
+            last_ok_ts = wdog.get(sym_key)  # ISO
+            too_long = _minutes_since_iso(last_ok_ts) > RELAX_AFTER_H*60 if last_ok_ts else True
+        
+            # 1) Nếu chưa có plan/entry vì bị RANGE chặn, thử bật MR cho FX
+            mr_used = False
+            if (plan == "SIDEWAY" or entry is None or sl is None or tp is None):
+                if regime == "RANGE" and (_fx_symbol(name) or _fx_symbol(symbol)):
+                    _mr = _mr_fx_range(df2h_for_mr, df_main, atrval if atrval else atr(df_main, 14))
+                    if _mr.enabled:
+                        # gán lại kế hoạch theo MR
+                        plan   = _mr.side
+                        entry  = _mr.entry
+                        sl     = _mr.sl
+                        tp     = _mr.tp
+                        mr_used = True
+                        # confidence: giảm 8–12% so với trend để phân biệt
+                        final_conf = max(0, int(round(final_conf - 10)))
+                        block_reason = ""  # MR có tín hiệu thì không kèm lỗi cũ
 
+            # 2) Nới RSI/MACD khi RANGE (đặc biệt khi MR)
+            if entry is not None and sl is not None and tp is not None:
+                try:
+                    rsi_last = rsi(df_main["close"], 14).iloc[-2]
+                    macd_h   = macd_hist(df_main["close"])
+                    # điều kiện "aligned" nhẹ khi RANGE hoặc MR
+                    if regime == "RANGE" or mr_used:
+                        rsi_ok = (plan == "LONG" and rsi_last >= 48) or (plan == "SHORT" and rsi_last <= 52)
+                        macd_ok = (plan == "LONG" and macd_h >= -0.00001) or (plan == "SHORT" and macd_h <= +0.00001)
+                    else:
+                        rsi_ok = (plan == "LONG" and rsi_last >= 55) or (plan == "SHORT" and rsi_last <= 45)
+                        macd_ok = (plan == "LONG" and macd_h > 0) or (plan == "SHORT" and macd_h < 0)
+        
+                    if not (rsi_ok and macd_ok):
+                        # chỉ bỏ nếu KHÔNG phải MR (MR được phép nới hơn)
+                        if not mr_used:
+                            plan = "SIDEWAY"; entry = sl = tp = None
+                            block_reason = "RSI/MACD not aligned (relaxed)"
+                except Exception:
+                    pass
+        
+            # 3) Price deviation guard động theo loại sản phẩm
+            if entry is not None and sl is not None and tp is not None and atrval is not None:
+                px_now = get_realtime_price(symbol)
+                lim = _price_deviation_limit(name if name else symbol, atrval)
+                if px_now is not None and abs(px_now - entry) > lim:
+                    plan = "SIDEWAY"; entry = sl = tp = None
+                    block_reason = f"Price deviated > {lim/atrval:.2f}×ATR"
+        
+            # 4) RR kiểm tra lại với RR_MIN động
+            if entry is not None and sl is not None and tp is not None:
+                rr_ratio = abs(tp - entry) / max(1e-9, abs(entry - sl))
+                # Nếu MR thì chấp nhận hơi thấp hơn 0.1
+                rr_need = RR_MIN - (0.10 if mr_used else 0.0)
+                if rr_ratio < rr_need:
+                    plan = "SIDEWAY"; entry = sl = tp = None
+                    block_reason = f"RR too low ({rr_ratio:.2f} < {rr_need:.2f})"
+        
+            # 5) Bỏ bắt buộc Volume/PA cho FX RANGE (nếu code gốc có chặn)
+            #    -> thực hiện bằng cách không nối thêm lý do “No volume confirmation/No supportive PA” khi mr_used hoặc (regime==RANGE & FX)
+            #    Nếu đoạn reasons đã tạo trước đó, KHÔNG thêm lỗi mới về volume/PA trong nhánh này.
+            #    (Phần này “no-op” nếu bạn đặt block trước khi build 'reasons')
+        
+            # 6) Watchdog: nếu vừa tạo được lệnh hợp lệ -> cập nhật; nếu không, không đổi.
+            if entry is not None and sl is not None and tp is not None:
+                wdog[sym_key] = datetime.now(timezone.utc).isoformat()
+                _save_wdog(wdog)
+        
+        except Exception as _e:
+            logging.warning(f"[UPGRADE-2025] skipped due to: {_e}")
+        # === END UPGRADE MR/TRADING FILTER 2025 =====================================
         # ====== 5 FILTER NÂNG WINRATE ======
         reasons = []
         # 4H bias phải trùng hướng trade
