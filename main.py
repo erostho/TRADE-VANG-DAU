@@ -427,21 +427,40 @@ def account_equity_usd():
     except Exception: pass
     return 100.0
 
+# Giới hạn lot & đòn bẩy
+MAX_LOT = float(os.getenv("MAX_LOT", "1.0"))     # tuỳ sàn, ví dụ 0.5 cho crypto
+MIN_LOT = float(os.getenv("MIN_LOT", "0.001"))
+LEVERAGE = float(os.getenv("LEVERAGE", "10"))    # nếu futures có đòn bẩy
+
 def compute_lot_size(entry, sl, symbol, name, risk_pct=0.005):
-    if entry is None or sl is None: return 0.0
-    dist=abs(entry-sl); 
-    if dist<=0: return 0.0
-    key=name if name in CONTRACT_SIZES else symbol
-    contract=CONTRACT_SIZES.get(key,100000)
-    if "JPY" in key: pipsize=0.01
-    elif "XAU" in key: pipsize=0.1
-    elif key=="CL": pipsize=0.01
-    elif "/" in key: pipsize=0.0001
-    else: pipsize=1.0
-    value_per_point=contract*pipsize
-    risk_money=account_equity_usd()*risk_pct
-    lots=risk_money/max(1e-9,(dist*value_per_point))
-    return round(max(lots,0.01),3)
+    if entry is None or sl is None:
+        return 0.0
+    dist = abs(entry - sl)
+    if dist <= 0:
+        return 0.0
+
+    key = name if name in CONTRACT_SIZES else symbol
+    contract = CONTRACT_SIZES.get(key, 100000)
+
+    # bước giá
+    if "JPY" in key:       pipsize = 0.01
+    elif "XAU" in key:     pipsize = 0.1
+    elif key == "CL":      pipsize = 0.01
+    elif "/" in key:       pipsize = 0.0001
+    else:                  pipsize = 1.0
+
+    value_per_point = contract * pipsize
+    risk_money = account_equity_usd() * risk_pct
+
+    lots = risk_money / max(1e-9, (dist * value_per_point))
+    # hiệu chỉnh theo leverage nếu cần
+    lots = lots / max(1.0, LEVERAGE)
+
+    # kẹp biên
+    if np.isnan(lots) or lots <= 0:
+        lots = MIN_LOT
+    lots = max(MIN_LOT, min(MAX_LOT, lots))
+    return round(lots, 3)
     
 # ============ Daily cache (1D) ============
 def load_daily_cache():
@@ -629,46 +648,70 @@ def detect_pullback(results: dict) -> str:
     return ""
 CONFIRM_STRONG = 70   # >=70%: mạnh
 CONFIRM_OK     = 55   # 55–69%: trung bình
-
 def smart_sl_tp(entry, atr, swing_hi, swing_lo, kup, kdn, side, is_fx):
-    # nhẹ tay hơn
-    base_mult = 2.0 if is_fx else 1.2      # (trước: 2.5 / 1.5)
-    buf = 0.3 * atr                         # (trước: 0.5 * ATR)
+    """
+    SL/TP thông minh:
+    - SL ưu tiên gần nhưng không chặt hơn 0.8*ATR
+    - TP luôn có khoảng cách dương và RR tối thiểu 1.8R (fallback)
+    - Có 'cap' bởi swing/keltner nếu phù hợp
+    """
+    if entry is None or atr is None or atr <= 0:
+        return None, None
+
+    base_mult = 2.0 if is_fx else 1.2   # SL “vừa tay”
+    buf = 0.3 * atr
 
     if side == "LONG":
-        # chọn SL gần hơn, nhưng không chặt hơn 0.8*ATR
+        # --- SL
         sl_candidates = [
             entry - base_mult * atr,
             (swing_lo - buf) if not np.isnan(swing_lo) else entry - base_mult * atr,
         ]
-        sl = max(sl_candidates)             # GẦN HƠN cho LONG
-        sl = min(sl, entry - 0.8 * atr)     # vẫn cách tối thiểu 0.8*ATR
+        sl = max(sl_candidates)                          # gần hơn cho LONG
+        sl = min(sl, entry - 0.8 * atr)                  # vẫn cách tối thiểu 0.8ATR
+        R = max(1e-9, entry - sl)                        # risk per unit
 
-        R = entry - sl
+        # --- RR mục tiêu + cap
+        rr_tp = min(max(1.8 * R, 1.2 * atr), 3.0 * atr)  # khung an toàn
+        cap = None
+        if not np.isnan(kup):       cap = max(cap or 0.0, max(0.0, kup - entry))
+        if not np.isnan(swing_hi):  cap = max(cap or 0.0, max(0.0, swing_hi - entry - buf))
 
-        # TP “thông minh” giữ nguyên
-        caps = [1.2 * R, 1.5 * atr]
-        if not np.isnan(kup):  caps.append(max(0.0, kup - entry))
-        if not np.isnan(swing_hi): caps.append(max(0.0, swing_hi - entry - buf))
-        tp = entry + max(0.0, min(caps))
+        tp_dist = rr_tp if (cap is None or cap <= 0) else min(rr_tp, cap)
 
-    else:  # SHORT
+        # --- Fallback cứng: luôn dương & đủ xa
+        if (tp_dist is None) or (tp_dist <= 0) or np.isnan(tp_dist):
+            tp_dist = max(1.8 * R, 1.2 * atr)
+
+        tp = entry + tp_dist
+        return sl, tp
+
+    elif side == "SHORT":
+        # --- SL
         sl_candidates = [
             entry + base_mult * atr,
             (swing_hi + buf) if not np.isnan(swing_hi) else entry + base_mult * atr,
         ]
-        sl = min(sl_candidates)             # GẦN HƠN cho SHORT
-        sl = max(sl, entry + 0.8 * atr)     # vẫn cách tối thiểu 0.8*ATR
+        sl = min(sl_candidates)                          # gần hơn cho SHORT
+        sl = max(sl, entry + 0.8 * atr)                  # vẫn cách tối thiểu 0.8ATR
+        R = max(1e-9, sl - entry)
 
-        R = sl - entry
+        # --- RR mục tiêu + cap
+        rr_tp = min(max(1.8 * R, 1.2 * atr), 3.0 * atr)
+        cap = None
+        if not np.isnan(kdn):       cap = max(cap or 0.0, max(0.0, entry - kdn))
+        if not np.isnan(swing_lo):  cap = max(cap or 0.0, max(0.0, entry - swing_lo - buf))
 
-        caps = [1.2 * R, 1.5 * atr]
-        if not np.isnan(kdn):      caps.append(max(0.0, entry - kdn))
-        if not np.isnan(swing_lo): caps.append(max(0.0, entry - swing_lo - buf))
-        tp = entry - max(0.0, min(caps))
+        tp_dist = rr_tp if (cap is None or cap <= 0) else min(rr_tp, cap)
 
-    return sl, tp
+        # --- Fallback cứng
+        if (tp_dist is None) or (tp_dist <= 0) or np.isnan(tp_dist):
+            tp_dist = max(1.8 * R, 1.2 * atr)
 
+        tp = entry - tp_dist
+        return sl, tp
+
+    return None, None
 
 def decide_signal_color(results: dict, final_dir: str, final_conf: int):
     """
@@ -1173,7 +1216,14 @@ def analyze_symbol(name, symbol, daily_cache):
                     )
                 except Exception as e:
                     logging.warning(f"⚠️ smart_sl_tp fallback: {e}")
-
+        # Fallback cuối: đảm bảo TP cách Entry đủ xa
+        if sl is not None and tp is not None and entry is not None:
+            R = max(1e-9, abs(entry - sl))
+            if abs(tp - entry) < max(1.8 * R, 1.2 * atrval):
+                if final_dir == "LONG":
+                    tp = entry + max(1.8 * R, 1.2 * atrval)
+                elif final_dir == "SHORT":
+                    tp = entry - max(1.8 * R, 1.2 * atrval)
         # === Nếu là dầu thì hiệu chỉnh giá ===
         if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
             entry = oil_adjust(entry)
