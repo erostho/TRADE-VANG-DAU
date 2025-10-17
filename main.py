@@ -484,34 +484,7 @@ def compute_lot_size(entry, sl, symbol, name, risk_pct=0.005):
         lots = MIN_LOT
     lots = max(MIN_LOT, min(MAX_LOT, lots))
     return round(lots, 3)
-def get_manual_price_exness(symbol: str) -> float | None:
-    """
-    Trả về giá Exness do bạn nhập tay qua ENV để làm mốc hiệu chỉnh.
-    Hỗ trợ cả 2 kiểu:
-      - EXNESS_XAU, EXNESS_XAG, EXNESS_WTI (rút gọn)
-      - EXNESS_XAU_USD, EXNESS_XAG_USD, EXNESS_WTI_USD (đầy đủ)
-    """
-    symbol = symbol.upper()
-    short_map = {
-        "XAU/USD": "EXNESS_XAU",
-        "XAG/USD": "EXNESS_XAG",
-        "CL":       "EXNESS_WTI",
-        "WTI/USD":  "EXNESS_WTI",
-    }
-    candidates = [
-        short_map.get(symbol),
-        f"EXNESS_{symbol.replace('/','_')}"
-    ]
-    for k in candidates:
-        if not k: 
-            continue
-        v = os.getenv(k, "")
-        try:
-            if v != "": 
-                return float(v)
-        except Exception:
-            continue
-    return None    
+
 # ============ Daily cache (1D) ============
 def load_daily_cache():
     try:
@@ -860,7 +833,77 @@ def oil_adjust(p: float) -> float:
     if p is None or (isinstance(p, float) and np.isnan(p)): 
         return p
     return p * _OIL_SCALE + _OIL_OFFSET
-    
+# === AUTO CALIBRATION: Align TV -> Exness for GOLD, SILVER, OIL ==========
+CALIB_TTL_MIN = int(os.getenv("CALIB_TTL_MIN", "60"))
+CALIB_CACHE_PATH = os.getenv("CALIB_CACHE_PATH", "/tmp/calib_align.json")
+
+def _load_calib_cache():
+    try:
+        return json.load(open(CALIB_CACHE_PATH, "r", encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_calib_cache(data):
+    try:
+        json.dump(data, open(CALIB_CACHE_PATH, "w", encoding="utf-8"))
+    except Exception:
+        pass
+
+def _minutes_since(ts_iso: str) -> float:
+    try:
+        t = datetime.fromisoformat(ts_iso)
+        return (datetime.now(timezone.utc) - t).total_seconds()/60.0
+    except Exception:
+        return 1e9
+
+def compute_symbol_calibration(symbol: str, exness_symbol: str) -> float:
+    """
+    Tính offset trung vị (median) giữa TwelveData (TV) và Exness.
+    offset = median(exness - tv)
+    Trả về offset (float).
+    """
+    cache = _load_calib_cache()
+    key = f"{symbol}-{exness_symbol}"
+    if key in cache and _minutes_since(cache[key]["ts"]) < CALIB_TTL_MIN:
+        return cache[key]["offset"]
+
+    df_tv = fetch_candles(symbol, "1h")
+    df_ex = fetch_candles(exness_symbol, "1h")
+    if df_tv is None or df_ex is None:
+        return 0.0
+
+    z = pd.merge_asof(
+        df_tv[["datetime", "close"]].rename(columns={"close": "tv"}),
+        df_ex[["datetime", "close"]].rename(columns={"close": "ex"}),
+        on="datetime", direction="nearest", tolerance=pd.Timedelta("30min")
+    ).dropna()
+
+    if len(z) < 10:
+        return 0.0
+
+    offset = float(np.median(z.tail(50)["ex"] - z.tail(50)["tv"]))
+    cache[key] = {"offset": offset, "ts": datetime.now(timezone.utc).isoformat()}
+    _save_calib_cache(cache)
+    return offset
+
+def apply_symbol_calibration(symbol: str, entry, sl, tp):
+    """
+    Tự động tịnh tiến Entry/SL/TP về giá Exness.
+    """
+    if symbol == "XAU/USD":
+        exness_symbol = "XAUUSD"      # hoặc XAU/USD:USD tuỳ provider Exness
+    elif symbol == "XAG/USD":
+        exness_symbol = "XAGUSD"
+    elif symbol in ("CL", "WTI/USD"):
+        exness_symbol = "XTIUSD"
+    else:
+        return entry, sl, tp, ""
+
+    offset = compute_symbol_calibration(symbol, exness_symbol)
+    if abs(offset) > 30:  # lệch >30$ thì bỏ qua (dữ liệu sai)
+        return entry, sl, tp, f"skip_large_offset {offset:+.2f}"
+
+    return entry + offset, sl + offset, tp + offset, f"aligned {offset:+.2f}"    
 # ---------- day stats / circuit breaker ----------
 def load_stats():
     try:
@@ -1275,25 +1318,16 @@ def analyze_symbol(name, symbol, daily_cache):
                     tp = entry + max(1.8 * R, 1.2 * atrval)
                 elif final_dir == "SHORT":
                     tp = entry - max(1.8 * R, 1.2 * atrval)
-        # === Nếu là dầu thì hiệu chỉnh giá ===
+        # === Nếu là dầu/XAU/XAG thì hiệu chỉnh giá ===
         if is_wti_name(name) and all(v is not None for v in (entry, sl, tp)):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-        # === OFFSET EXNESS VS TV (chỉ kim loại để tránh double-adjust dầu) ===
-        EXNESS_ADJUST_SYMBOLS = {"XAU/USD", "XAG/USD"}
-        if symbol in EXNESS_ADJUST_SYMBOLS and all(v is not None for v in (entry, sl, tp)):
-            # ưu tiên lấy giá TV hiện tại để đo offset tức thời
-            td_price = get_price_twelvedata(symbol, API_KEY)  # có thể None
-            ex_price = get_manual_price_exness(symbol)        # từ ENV: EXNESS_XAU_USD=...
-            if td_price is not None and ex_price is not None:
-                offset = ex_price - td_price
-                entry += offset
-                sl    += offset
-                tp    += offset
-                # báo cho phần message (không dùng lines ở đây)
-                note = f"Adjusted to Exness feed (offset {offset:+.2f})"
-                block_reason = (block_reason + " | " + note) if block_reason else note
+        if symbol in ("XAU/USD", "XAG/USD"):
+            entry, sl, tp, align_note = apply_symbol_calibration(symbol, entry, sl, tp)
+            if align_note:
+                logging.info(f"[ALIGN] {symbol} {align_note}")
+
         # === UPGRADE MR/TRADING FILTER 2025 =========================================
         # Mục tiêu:
         # 1) Cho phép Mean-Reversion (MR) an toàn cho FX khi RANGE
