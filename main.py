@@ -891,11 +891,9 @@ def apply_symbol_calibration(symbol: str, entry, sl, tp):
     Tự động tịnh tiến Entry/SL/TP về giá Exness.
     """
     if symbol == "XAU/USD":
-        exness_symbol = "XAUUSD"      # hoặc XAU/USD:USD tuỳ provider Exness
+        exness_symbol = "XAU/USD"      # hoặc XAU/USD:USD tuỳ provider Exness
     elif symbol == "XAG/USD":
-        exness_symbol = "XAGUSD"
-    elif symbol in ("CL", "WTI/USD"):
-        exness_symbol = "XTIUSD"
+        exness_symbol = "XAG/USD"
     else:
         return entry, sl, tp, ""
 
