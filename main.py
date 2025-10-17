@@ -1405,13 +1405,65 @@ def analyze_symbol(name, symbol, daily_cache):
                     block_reason = f"Price deviated > {lim/atrval:.2f}×ATR"
         
             # 4) RR kiểm tra lại với RR_MIN động
+            # === Dynamic RR min + smart TP expand + optional SCALP ===
+            MIN_RR_BASE = float(os.getenv("MIN_RR_BASE", "1.8"))
+            MIN_RR_TREND_BONUS = float(os.getenv("MIN_RR_TREND_BONUS", "-0.2"))
+            MIN_RR_HICONF_BONUS = float(os.getenv("MIN_RR_HICONF_BONUS", "-0.2"))
+            MIN_RR_CLAMP_LOW = float(os.getenv("MIN_RR_CLAMP_LOW", "1.4"))
+            MIN_RR_CLAMP_HIGH = float(os.getenv("MIN_RR_CLAMP_HIGH", "2.2"))
+            SCALP_MODE_ON = os.getenv("SCALP_MODE_ON", "1") == "1"
+            SCALP_MIN_RR = float(os.getenv("SCALP_MIN_RR", "1.30"))
+            SCALP_RISK_MULT = float(os.getenv("SCALP_RISK_MULT", "0.5"))
+            
+            def _calc_rr(e, s, t):
+                return abs(t - e) / max(1e-9, abs(e - s))
+            
             if entry is not None and sl is not None and tp is not None:
-                rr_ratio = abs(tp - entry) / max(1e-9, abs(entry - sl))
-                # Nếu MR thì chấp nhận hơi thấp hơn 0.1
-                rr_need = RR_MIN - (0.10 if mr_used else 0.0)
-                if rr_ratio < rr_need:
-                    plan = "SIDEWAY"; entry = sl = tp = None
-                    block_reason = f"RR too low ({rr_ratio:.2f} < {rr_need:.2f})"
+                rr_ratio = _calc_rr(entry, sl, tp)
+                regime = "TREND" if results.get("4H") in ("LONG", "SHORT") else "RANGE"
+                rr_min = MIN_RR_BASE
+                if regime == "TREND":
+                    rr_min += MIN_RR_TREND_BONUS
+                if final_conf >= 85:
+                    rr_min += MIN_RR_HICONF_BONUS
+                rr_min = float(min(MIN_RR_CLAMP_HIGH, max(MIN_RR_CLAMP_LOW, rr_min)))
+            
+                # thử nới TP lên nếu RR chỉ thiếu chút
+                if rr_ratio < rr_min:
+                    try:
+                        k_mid, kup, kdn = keltner_mid(df_main, 20, atr_mult=1.0)
+                    except Exception:
+                        kup = kdn = np.nan
+            
+                    if final_dir == "LONG":
+                        desired_tp = entry + rr_min * abs(entry - sl)
+                        caps = [desired_tp]
+                        if not np.isnan(kup): caps.append(kup)
+                        if not np.isnan(swing_hi): caps.append(swing_hi)
+                        tp_new = min(caps)
+                        rr_new = _calc_rr(entry, sl, tp_new)
+                        if rr_new >= rr_min * 0.98:
+                            tp = tp_new
+                            rr_ratio = rr_new
+            
+                    elif final_dir == "SHORT":
+                        desired_tp = entry - rr_min * abs(entry - sl)
+                        caps = [desired_tp]
+                        if not np.isnan(kdn): caps.append(kdn)
+                        if not np.isnan(swing_lo): caps.append(swing_lo)
+                        tp_new = max(caps)
+                        rr_new = _calc_rr(entry, sl, tp_new)
+                        if rr_new >= rr_min * 0.98:
+                            tp = tp_new
+                            rr_ratio = rr_new
+            
+                if rr_ratio < rr_min:
+                    if SCALP_MODE_ON and rr_ratio >= SCALP_MIN_RR:
+                        reasons.append(f"SCALP mode (RR {rr_ratio:.2f} < {rr_min:.2f})")
+                        rpct = dynamic_risk_pct(final_conf, regime) * SCALP_RISK_MULT
+                        lots = compute_lot_size(entry, sl, symbol, name, risk_pct=rpct)
+                    else:
+                        reasons.append(f"RR too low ({rr_ratio:.2f} < {rr_min:.2f})")
         
             # 5) Bỏ bắt buộc Volume/PA cho FX RANGE (nếu code gốc có chặn)
             #    -> thực hiện bằng cách không nối thêm lý do “No volume confirmation/No supportive PA” khi mr_used hoặc (regime==RANGE & FX)
