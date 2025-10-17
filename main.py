@@ -813,14 +813,11 @@ def compute_oil_calibration() -> tuple[float, float]:
     y = df_ex[["datetime", "close"]].rename(columns={"close":"ex"}).copy()
     z = pd.merge_asof(x.sort_values("datetime"), y.sort_values("datetime"),
                       on="datetime", direction="nearest", tolerance=pd.Timedelta("30min")).dropna()
-
     if len(z) < 10:
         return (OIL_PRICE_SCALE_ENV, OIL_PRICE_OFFSET_ENV)
-
     z = z.tail(50)  # 50 điểm gần nhất
     offset = float(np.median(z["ex"] - z["cl"]))
     scale  = 1.0
-
     _save_oil_calib_cache({"ts": datetime.now(timezone.utc).isoformat(),
                            "scale": scale, "offset": offset})
     return (scale, offset)
@@ -884,6 +881,14 @@ def compute_symbol_calibration(symbol: str, exness_symbol: str) -> float:
     offset = float(np.median(z.tail(50)["ex"] - z.tail(50)["tv"]))
     cache[key] = {"offset": offset, "ts": datetime.now(timezone.utc).isoformat()}
     _save_calib_cache(cache)
+    # --- Debug log giá Exness vs TV ---
+    try:
+        latest_ex = z["ex"].iloc[-1]
+        latest_tv = z["tv"].iloc[-1]
+        logging.info(f"[CALIB DEBUG] {symbol}: Exness={latest_ex:.2f}, TV={latest_tv:.2f}, Offset={offset:+.2f}")
+    except Exception as e:
+        logging.warning(f"[CALIB DEBUG] Could not log calibration data for {symbol}: {e}")
+    # --- end debug log ---
     return offset
 
 def apply_symbol_calibration(symbol: str, entry, sl, tp):
