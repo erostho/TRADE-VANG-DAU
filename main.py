@@ -116,6 +116,28 @@ VOL_ATR_MULT  = float(os.getenv("VOL_ATR_MULT", "1.25"))  # ATR hiện tại > 1
 # Bias tracking
 BIAS_INVALIDATE_MIN = int(os.getenv("BIAS_INVALIDATE_MIN", "60"))  # 60' sau tín hiệu nếu mất bias thì huỷ
 # ================ HELPERS ================
+# === AUTO OFFSET EXNESS ALIGNER ===
+def get_price_twelvedata(symbol: str, api_key: str) -> float | None:
+    try:
+        url = f"https://api.twelvedata.com/price?symbol={symbol}&apikey={api_key}"
+        r = requests.get(url, timeout=8).json()
+        if "price" in r:
+            return float(r["price"])
+    except Exception as e:
+        logging.warning(f"TwelveData error {symbol}: {e}")
+    return None
+
+def get_manual_price_exness(symbol: str) -> float | None:
+    """
+    Lấy giá Exness thủ công (nhập tay qua biến môi trường).
+    Ví dụ: EXNESS_XAU=61.35
+    """
+    key = f"EXNESS_{symbol.replace('/', '_').upper()}"
+    val = os.getenv(key)
+    try:
+        return float(val) if val else None
+    except:
+        return None
 # cache 1 lần chạy
 RUN_CACHE = {}
 def fetch_candles(symbol, interval, retries=3, use_cache=True):
@@ -462,7 +484,34 @@ def compute_lot_size(entry, sl, symbol, name, risk_pct=0.005):
         lots = MIN_LOT
     lots = max(MIN_LOT, min(MAX_LOT, lots))
     return round(lots, 3)
-    
+def get_manual_price_exness(symbol: str) -> float | None:
+    """
+    Trả về giá Exness do bạn nhập tay qua ENV để làm mốc hiệu chỉnh.
+    Hỗ trợ cả 2 kiểu:
+      - EXNESS_XAU, EXNESS_XAG, EXNESS_WTI (rút gọn)
+      - EXNESS_XAU_USD, EXNESS_XAG_USD, EXNESS_WTI_USD (đầy đủ)
+    """
+    symbol = symbol.upper()
+    short_map = {
+        "XAU/USD": "EXNESS_XAU",
+        "XAG/USD": "EXNESS_XAG",
+        "CL":       "EXNESS_WTI",
+        "WTI/USD":  "EXNESS_WTI",
+    }
+    candidates = [
+        short_map.get(symbol),
+        f"EXNESS_{symbol.replace('/','_')}"
+    ]
+    for k in candidates:
+        if not k: 
+            continue
+        v = os.getenv(k, "")
+        try:
+            if v != "": 
+                return float(v)
+        except Exception:
+            continue
+    return None    
 # ============ Daily cache (1D) ============
 def load_daily_cache():
     try:
@@ -811,6 +860,7 @@ def oil_adjust(p: float) -> float:
     if p is None or (isinstance(p, float) and np.isnan(p)): 
         return p
     return p * _OIL_SCALE + _OIL_OFFSET
+    
 # ---------- day stats / circuit breaker ----------
 def load_stats():
     try:
@@ -1230,7 +1280,20 @@ def analyze_symbol(name, symbol, daily_cache):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-        # === UPGRADE MR/TRADING FILTER 2025 
+        # === OFFSET EXNESS VS TV (chỉ kim loại để tránh double-adjust dầu) ===
+        EXNESS_ADJUST_SYMBOLS = {"XAU/USD", "XAG/USD"}
+        if symbol in EXNESS_ADJUST_SYMBOLS and all(v is not None for v in (entry, sl, tp)):
+            # ưu tiên lấy giá TV hiện tại để đo offset tức thời
+            td_price = get_price_twelvedata(symbol, API_KEY)  # có thể None
+            ex_price = get_manual_price_exness(symbol)        # từ ENV: EXNESS_XAU_USD=...
+            if td_price is not None and ex_price is not None:
+                offset = ex_price - td_price
+                entry += offset
+                sl    += offset
+                tp    += offset
+                # báo cho phần message (không dùng lines ở đây)
+                note = f"Adjusted to Exness feed (offset {offset:+.2f})"
+                block_reason = (block_reason + " | " + note) if block_reason else note
         # === UPGRADE MR/TRADING FILTER 2025 =========================================
         # Mục tiêu:
         # 1) Cho phép Mean-Reversion (MR) an toàn cho FX khi RANGE
