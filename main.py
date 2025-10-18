@@ -1592,6 +1592,43 @@ def analyze_symbol(name, symbol, daily_cache):
         
         except Exception as _e:
             logging.warning(f"[UPGRADE-2025] skipped due to: {_e}")
+
+        # ---- Breakout trigger (sau squeeze) ----
+        try:
+            m = df_main['close'].rolling(20).mean()
+            s = df_main['close'].rolling(20).std()
+            upper = m + 2*s; lower = m - 2*s
+            e20, e50 = ema(df_main['close'], 20), ema(df_main['close'], 50)
+            bw = bb_width(df_main, 20)
+        
+            brk_long  = (df_main['close'].iloc[-2] > upper.iloc[-2]) and (e20.iloc[-2] > e50.iloc[-2])
+            brk_short = (df_main['close'].iloc[-2] < lower.iloc[-2]) and (e20.iloc[-2] < e50.iloc[-2])
+        
+            if plan == "SIDEWAY":  # chỉ dùng làm công tắc bật lệnh khi mọi thứ khác OK
+                if brk_long and final_dir == "LONG" and bw < VOL_BW_HIGH:
+                    plan = "LONG"
+                elif brk_short and final_dir == "SHORT" and bw < VOL_BW_HIGH:
+                    plan = "SHORT"
+        except Exception:
+            pass
+
+        # ---- Pullback-to-MA trigger ----
+        try:
+            e20 = ema(df_main['close'], 20)
+            e50 = ema(df_main['close'], 50)
+            c2, o2 = float(df_main['close'].iloc[-2]), float(df_main['open'].iloc[-2])
+            r2 = float(rsi(df_main['close'], 14).iloc[-2])
+        
+            pulled_long  = (min(o2, c2) <= e20.iloc[-2] <= max(o2, c2)) and (c2 > e20.iloc[-2]) and (e20.iloc[-2] > e50.iloc[-2]) and (r2 >= 50)
+            pulled_short = (min(o2, c2) <= e20.iloc[-2] <= max(o2, c2)) and (c2 < e20.iloc[-2]) and (e20.iloc[-2] < e50.iloc[-2]) and (r2 <= 50)
+        
+            if plan == "SIDEWAY":
+                if pulled_long and final_dir == "LONG":
+                    plan = "LONG"
+                elif pulled_short and final_dir == "SHORT":
+                    plan = "SHORT"
+        except Exception:
+            pass
         # === END UPGRADE MR/TRADING FILTER 2025 =====================================
         # ====== 5 FILTER NÂNG WINRATE ======
         reasons = []
