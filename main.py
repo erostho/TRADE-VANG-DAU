@@ -1802,28 +1802,28 @@ def main():
         # dàn request để không vượt quota
         time.sleep(10)
     
-    # Gửi bản thông minh   
-    had_entry   = any("Entry" in l for l in lines)
-    had_blocked = any(l.startswith("⛔ ") for l in lines)
-    if had_entry or had_blocked:
-        send_telegram("\n".join(lines))
-    else:
+    #1 Gửi bản thông minh   
+    #had_entry   = any("Entry" in l for l in lines)
+    #had_blocked = any(l.startswith("⛔ ") for l in lines)
+    #if had_entry or had_blocked:
+        #send_telegram("\n".join(lines))
+    #else:
         # vẫn gửi bản tóm tắt tối thiểu để biết hệ thống đang chạy
-        send_telegram("\n".join(lines[:10]))
-    # Nếu tất cả đều N/A/SIDEWAY & không có Entry -> vẫn gửi để biết trạng thái; nếu muốn có thể chặn tại đây
+        #send_telegram("\n".join(lines[:10]))
+    #2 Nếu tất cả đều N/A/SIDEWAY & không có Entry -> vẫn gửi để biết trạng thái; nếu muốn có thể chặn tại đây
     #msg = "\n".join(lines)
     #send_telegram(msg)
     
-    # Chỉ gửi nếu có ít nhất 1 symbol có Entry thật (không phải N/A)
-    #valid_msg = any(
-    #("Entry" in l and not any(x in l for x in ["N/A", "None", "NaN"]))
-    #for l in lines
-#)
-    #if valid_msg:
-        #msg = "\n".join(lines)
-        #send_telegram(msg)
-    #else:
-        #print("🚫 Tất cả đều N/A, không gửi Telegram")
+    #3 Chỉ gửi nếu có ít nhất 1 symbol có Entry thật (không phải N/A)
+    valid_msg = any(
+    ("Entry" in l and not any(x in l for x in ["N/A", "None", "NaN"]))
+    for l in lines
+)
+    if valid_msg:
+        msg = "\n".join(lines)
+        send_telegram(msg)
+    else:
+        print("🚫 Tất cả đều N/A, không gửi Telegram")
 
 if __name__ == "__main__":
     main()
