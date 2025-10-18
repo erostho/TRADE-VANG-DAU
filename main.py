@@ -893,20 +893,34 @@ def compute_symbol_calibration(symbol: str, exness_symbol: str) -> float:
 
 def apply_symbol_calibration(symbol: str, entry, sl, tp):
     """
-    Tự động tịnh tiến Entry/SL/TP về giá Exness.
+    Tinh chỉnh Entry/SL/TP về giá Exness cho kim loại (XAU, XAG).
+    An toàn: nếu thiếu dữ liệu thì trả về nguyên trạng.
     """
-    if symbol == "XAU/USD":
-        exness_symbol = "XAU/USD"      # hoặc XAU/USD:USD tuỳ provider Exness
-    elif symbol == "XAG/USD":
-        exness_symbol = "XAG/USD"
-    else:
+    # Chưa có lệnh -> không làm gì
+    if not all(v is not None for v in (entry, sl, tp)):
         return entry, sl, tp, ""
 
-    offset = compute_symbol_calibration(symbol, exness_symbol)
-    if abs(offset) > 30:  # lệch >30$ thì bỏ qua (dữ liệu sai)
+    # Chỉ align cho vàng/bạc; dầu đã có oil_adjust rồi
+    if symbol not in ("XAU/USD", "XAG/USD"):
+        return entry, sl, tp, ""
+
+    # Map đích sang Exness (nếu bạn dùng ký hiệu khác thì sửa ở đây)
+    exness_symbol = symbol  # "XAU/USD" hoặc "XAG/USD"
+
+    # Tính offset; nếu lỗi/None thì coi như 0
+    try:
+        offset = compute_symbol_calibration(symbol, exness_symbol)
+    except Exception:
+        offset = 0.0
+
+    if offset is None or (isinstance(offset, float) and np.isnan(offset)):
+        offset = 0.0
+
+    # Nếu lệch quá lớn thì bỏ qua để tránh dữ liệu sai
+    if abs(offset) > 30:
         return entry, sl, tp, f"skip_large_offset {offset:+.2f}"
 
-    return entry + offset, sl + offset, tp + offset, f"aligned {offset:+.2f}"    
+    return entry + offset, sl + offset, tp + offset, f"aligned {offset:+.2f}"
 # ---------- day stats / circuit breaker ----------
 def load_stats():
     try:
@@ -1326,7 +1340,7 @@ def analyze_symbol(name, symbol, daily_cache):
             entry = oil_adjust(entry)
             sl    = oil_adjust(sl)
             tp    = oil_adjust(tp)
-        if symbol in ("XAU/USD", "XAG/USD"):
+        #if symbol in ("XAU/USD", "XAG/USD"):
             entry, sl, tp, align_note = apply_symbol_calibration(symbol, entry, sl, tp)
             if align_note:
                 logging.info(f"[ALIGN] {symbol} {align_note}")
