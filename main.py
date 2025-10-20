@@ -1735,95 +1735,98 @@ def send_telegram(msg):
 
 # ================ MAIN =================
 def main():
-    # luôn kiểm tra/làm mới cache 1D (chỉ fetch khi tới giờ/đúng ngày)
-    daily_cache = maybe_refresh_daily_cache()
-    RUN_CACHE.clear()  # đảm bảo nến mới được tải
-    # === Hiệu chuẩn dầu tự động (nếu có ticker bên Exness) ===
-    global _OIL_SCALE, _OIL_OFFSET
-    _OIL_SCALE, _OIL_OFFSET = compute_oil_calibration()
-    logging.info(f"Oil calibration: scale={_OIL_SCALE:.4f}, offset={_OIL_OFFSET:.4f}")
-    lines = []
-    now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-    lines.append("💵 TRADE GOODS")
-    lines.append(f"⏱ {now}\n")
-
-    any_symbol_has_data = False
-
-    for name, sym in symbols.items():
-        results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf, lots, block_reason = analyze_symbol(name, sym, daily_cache)
-        # Cảnh báo fast-flip 2H nếu có
-        df_2h_check = fetch_candles(sym, "2h")
-        fast_flip = False
-        if df_2h_check is not None and len(df_2h_check) > 60:
-            e20_2h = df_2h_check["close"].ewm(span=20, adjust=False).mean()
-            two_red = (df_2h_check["close"].iloc[-1] < df_2h_check["open"].iloc[-1]) and (df_2h_check["close"].iloc[-2] < df_2h_check["open"].iloc[-2])
-            below_e20 = df_2h_check["close"].iloc[-1] < e20_2h.iloc[-1]
-            slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
-            if two_red and below_e20 and slope_neg:
-                fast_flip = True
-
-        if has_data:
-            any_symbol_has_data = True
-
-        lines.append(f"==={name}===")
-        for group, trend in results.items():
-            lines.append(f"{group}: {compact_label(group, trend)}")
-
-        # —— Pullback & Color
-        pb = detect_pullback(results)
-        emoji, size_label = decide_signal_color(results, final_dir, int(round(final_conf)))
-        
-        regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
-        if pb == "DOWN":
-            lines.append("⚠️ Pullback: 1H ngược 4H/1D (DOWN) – cân nhắc chờ xác nhận")
-        elif pb == "UP":
-            lines.append("⚠️ Pullback: 1H ngược 4H/1D (UP) – cân nhắc chờ xác nhận")
-        
-        # dòng Confidence có màu & size gợi ý
-        lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime}") 
-        #| Size: {size_label}")
-        if fast_flip:
-            lines.append(f"⚡ Fast-flip 2H active — chờ nến kế tiếp")        
-
-        # thêm Confidence + Regime (không ảnh hưởng logic cũ)
-        #regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
-        #lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
-
-        if entry is not None and sl is not None and tp is not None:
-            lines.append(
-                f"Entry {format_price(name if name in ('EUR/USD','USD/JPY') else sym, entry)} | "
-                f"SL {format_price(name if name in ('EUR/USD','USD/JPY') else sym, sl)} | "
-                f"TP {format_price(name if name in ('EUR/USD','USD/JPY') else sym, tp)}"
-                + (f" | Size {lots:.3f} lot" if lots and lots>0 else "")
-            )
-        elif block_reason:
-            lines.append(f"⛔ {block_reason}")
-
-        # dàn request để không vượt quota
-        time.sleep(10)
+    import traceback
+    try:    
+        # luôn kiểm tra/làm mới cache 1D (chỉ fetch khi tới giờ/đúng ngày)
+        daily_cache = maybe_refresh_daily_cache()
+        RUN_CACHE.clear()  # đảm bảo nến mới được tải
+        # === Hiệu chuẩn dầu tự động (nếu có ticker bên Exness) ===
+        global _OIL_SCALE, _OIL_OFFSET
+        _OIL_SCALE, _OIL_OFFSET = compute_oil_calibration()
+        logging.info(f"Oil calibration: scale={_OIL_SCALE:.4f}, offset={_OIL_OFFSET:.4f}")
+        lines = []
+        now = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+        lines.append("💵 TRADE GOODS")
+        lines.append(f"⏱ {now}\n")
     
-    #1 Gửi bản thông minh   
-    #had_entry   = any("Entry" in l for l in lines)
-    #had_blocked = any(l.startswith("⛔ ") for l in lines)
-    #if had_entry or had_blocked:
-        #send_telegram("\n".join(lines))
-    #else:
-        # vẫn gửi bản tóm tắt tối thiểu để biết hệ thống đang chạy
-        #send_telegram("\n".join(lines[:10]))
-    #2 Nếu tất cả đều N/A/SIDEWAY & không có Entry -> vẫn gửi để biết trạng thái; nếu muốn có thể chặn tại đây
-    #msg = "\n".join(lines)
-    #send_telegram(msg)
+        any_symbol_has_data = False
     
-    #3 Chỉ gửi nếu có ít nhất 1 symbol có Entry thật (không phải N/A)
-    valid_msg = any(
-    ("Entry" in l and not any(x in l for x in ["N/A", "None", "NaN"]))
-    for l in lines
-)
-    if valid_msg:
-        msg = "\n".join(lines)
-        send_telegram(msg)
-    else:
-        print("🚫 Tất cả đều N/A, không gửi Telegram")
-
+        for name, sym in symbols.items():
+            results, plan, entry, sl, tp, atrval, has_data, final_dir, final_conf, lots, block_reason = analyze_symbol(name, sym, daily_cache)
+            # Cảnh báo fast-flip 2H nếu có
+            df_2h_check = fetch_candles(sym, "2h")
+            fast_flip = False
+            if df_2h_check is not None and len(df_2h_check) > 60:
+                e20_2h = df_2h_check["close"].ewm(span=20, adjust=False).mean()
+                two_red = (df_2h_check["close"].iloc[-1] < df_2h_check["open"].iloc[-1]) and (df_2h_check["close"].iloc[-2] < df_2h_check["open"].iloc[-2])
+                below_e20 = df_2h_check["close"].iloc[-1] < e20_2h.iloc[-1]
+                slope_neg = (e20_2h.iloc[-1] - e20_2h.iloc[-6]) < 0
+                if two_red and below_e20 and slope_neg:
+                    fast_flip = True
+    
+            if has_data:
+                any_symbol_has_data = True
+    
+            lines.append(f"==={name}===")
+            for group, trend in results.items():
+                lines.append(f"{group}: {compact_label(group, trend)}")
+    
+            # —— Pullback & Color
+            pb = detect_pullback(results)
+            emoji, size_label = decide_signal_color(results, final_dir, int(round(final_conf)))
+            
+            regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
+            if pb == "DOWN":
+                lines.append("⚠️ Pullback: 1H ngược 4H/1D (DOWN) – cân nhắc chờ xác nhận")
+            elif pb == "UP":
+                lines.append("⚠️ Pullback: 1H ngược 4H/1D (UP) – cân nhắc chờ xác nhận")
+            
+            # dòng Confidence có màu & size gợi ý
+            lines.append(f"{emoji} Confidence: {int(round(final_conf))}% | Regime: {regime}") 
+            #| Size: {size_label}")
+            if fast_flip:
+                lines.append(f"⚡ Fast-flip 2H active — chờ nến kế tiếp")        
+    
+            # thêm Confidence + Regime (không ảnh hưởng logic cũ)
+            #regime = "TREND" if results.get("4H") in ("LONG","SHORT") else "RANGE"
+            #lines.append(f"Confidence: {final_conf}% | Regime: {regime}")
+    
+            if entry is not None and sl is not None and tp is not None:
+                lines.append(
+                    f"Entry {format_price(name if name in ('EUR/USD','USD/JPY') else sym, entry)} | "
+                    f"SL {format_price(name if name in ('EUR/USD','USD/JPY') else sym, sl)} | "
+                    f"TP {format_price(name if name in ('EUR/USD','USD/JPY') else sym, tp)}"
+                    + (f" | Size {lots:.3f} lot" if lots and lots>0 else "")
+                )
+            elif block_reason:
+                lines.append(f"⛔ {block_reason}")
+    
+            # dàn request để không vượt quota
+            time.sleep(10)
+        
+        #1 Gửi bản thông minh   
+        #had_entry   = any("Entry" in l for l in lines)
+        #had_blocked = any(l.startswith("⛔ ") for l in lines)
+        #if had_entry or had_blocked:
+            #send_telegram("\n".join(lines))
+        #else:
+            # vẫn gửi bản tóm tắt tối thiểu để biết hệ thống đang chạy
+            #send_telegram("\n".join(lines[:10]))
+        #2 Nếu tất cả đều N/A/SIDEWAY & không có Entry -> vẫn gửi để biết trạng thái; nếu muốn có thể chặn tại đây
+        #msg = "\n".join(lines)
+        #send_telegram(msg)
+        
+        #3 Chỉ gửi nếu có ít nhất 1 symbol có Entry thật (không phải N/A)
+        valid_msg = any(
+        ("Entry" in l and not any(x in l for x in ["N/A", "None", "NaN"]))
+        for l in lines
+    )
+        if valid_msg:
+            msg = "\n".join(lines)
+            send_telegram(msg)
+        else:
+            print("🚫 Tất cả đều N/A, không gửi Telegram")
+    except Exception:
+        logging.error(traceback.format_exc())
 if __name__ == "__main__":
     main()
