@@ -1720,6 +1720,208 @@ def analyze_symbol(name, symbol, daily_cache):
                 log_signal(name, plan, entry, sl, tp, final_conf, regime, lots)
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots, block_reason
+# ================= OFFLINE CANDLE CACHE (no API backtest) =================
+CANDLE_CACHE_DIR = os.getenv("CANDLE_CACHE_DIR", "/tmp/candles_cache")
+os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
+
+def _safe_name(x: str) -> str:
+    return x.upper().replace("/", "_").replace(" ", "_")
+
+def _cache_file(symbol: str, interval: str) -> str:
+    return os.path.join(CANDLE_CACHE_DIR, f"{_safe_name(symbol)}__{interval}.parquet")
+
+def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
+    """Gộp incremental và lưu Parquet; gọi ngay MỖI LẦN fetch_candles trả về df."""
+    try:
+        if df is None or len(df) == 0:
+            return
+        p = _cache_file(symbol, interval)
+        # Chuẩn hoá kiểu và UTC
+        d = df.copy()
+        d["datetime"] = pd.to_datetime(d["datetime"], utc=True)
+        for c in ["open","high","low","close"]:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+        d = d.dropna(subset=["datetime","open","high","low","close"])
+        if os.path.exists(p):
+            old = pd.read_parquet(p)
+            old["datetime"] = pd.to_datetime(old["datetime"], utc=True)
+            merged = pd.concat([old, d], ignore_index=True)
+            merged = merged.drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+            merged.to_parquet(p, index=False)
+        else:
+            d.sort_values("datetime").to_parquet(p, index=False)
+    except Exception as e:
+        logging.warning(f"[CACHE] save failed {symbol}-{interval}: {e}")
+
+def load_candles_local(symbol: str, interval: str, min_days: int = 90) -> pd.DataFrame | None:
+    """Chỉ đọc file local; KHÔNG gọi API. Trả về df tối thiểu ~min_days (nếu đủ)."""
+    try:
+        p = _cache_file(symbol, interval)
+        if not os.path.exists(p):
+            return None
+        df = pd.read_parquet(p)
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+        df = df.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        # Cắt 90 ngày gần nhất (dưới dạng thời gian)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=min_days)
+        df = df[df["datetime"] >= cutoff].reset_index(drop=True)
+        # ép kiểu số
+        for c in ["open","high","low","close"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["open","high","low","close"])
+        return df if len(df) > 120 else None
+    except Exception as e:
+        logging.warning(f"[CACHE] load failed {symbol}-{interval}: {e}")
+        return None
+
+# Patch fetch_candles để LUÔN lưu cache khi đã gọi API
+_ORIG_fetch_candles = fetch_candles
+def fetch_candles(symbol, interval, retries=3, use_cache=True):
+    df = _ORIG_fetch_candles(symbol, interval, retries=retries, use_cache=use_cache)
+    # Mỗi lần có df từ API -> lưu xuống đĩa (để backtest sau này không cần API)
+    try:
+        if df is not None and len(df) > 0:
+            save_candles_to_disk(symbol, interval, df)
+    except Exception:
+        pass
+    return df
+# ================= END OFFLINE CANDLE CACHE =================
+# ========================= BACKTEST 90D OFFLINE ============================
+RUN_BACKTEST_OFFLINE = os.getenv("RUN_BACKTEST_OFFLINE", "0") == "1"
+BACKTEST_CSV_PATH    = os.getenv("BACKTEST_CSV_PATH", "/tmp/backtest_90d.csv")
+
+def _first_hit_outcome(side: str, entry: float, sl: float, tp: float, df_future: pd.DataFrame):
+    if df_future is None or len(df_future) == 0:
+        return "TIMEOUT", 0
+    max_ahead = min(40, len(df_future))
+    for i in range(max_ahead):
+        hi = float(df_future["high"].iloc[i])
+        lo = float(df_future["low" ].iloc[i])
+        if side == "LONG":
+            if lo <= sl: return "SL", i+1
+            if hi >= tp: return "TP", i+1
+        else:
+            if hi >= sl: return "SL", i+1
+            if lo <= tp: return "TP", i+1
+    return "TIMEOUT", max_ahead
+
+def _bt_sideway_block_offline(df2h: pd.DataFrame, name_or_sym: str) -> bool:
+    if df2h is None or len(df2h) < 60:
+        return True
+    a2  = adx(df2h, 14)
+    bw2 = bb_width(df2h, 20)
+    if is_crypto(name_or_sym):
+        BW_MIN = 0.020
+    elif is_commodity(name_or_sym):
+        BW_MIN = 0.015
+    else:
+        BW_MIN = 0.012
+    return (np.isnan(a2) or a2 < 20) or (np.isnan(bw2) or bw2 < BW_MIN)
+
+def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None):
+    tf = main_tf or os.getenv("MAIN_TF", "2h")
+
+    # CHỈ đọc local, tuyệt đối không gọi API
+    df_main = load_candles_local(symbol, tf, min_days=95)
+    df_2h   = df_main if tf == "2h" else load_candles_local(symbol, "2h", min_days=95)
+
+    if df_main is None or len(df_main) < 150:
+        return {"symbol": name, "trades": 0, "win": 0, "loss": 0, "timeout": 0, "winrate": 0.0, "expR": 0.0}
+
+    rows = []; wins=losses=tout=0; total_R=0.0
+
+    for i in range(80, len(df_main) - 2):
+        hist = df_main.iloc[:i+1].copy()
+        if len(hist) < 65:
+            continue
+
+        bias = strong_trend(hist)
+        if bias not in ("LONG","SHORT"):
+            continue
+
+        if _bt_sideway_block_offline(df_2h.iloc[:i+1] if df_2h is not None else None, name or symbol):
+            continue
+
+        entry = float(hist["close"].iloc[-1])  # close của nến -2
+        atrv  = atr(hist, 14)
+        swing_hi, swing_lo = swing_levels(hist, 20)
+
+        # Keltner/Donchian trên chính tf
+        try:
+            km, kup, kdn = keltner_mid(hist, 20, atr_mult=1.0)
+        except Exception:
+            km = kup = kdn = np.nan
+
+        sl, tp = smart_sl_tp(entry, atrv, swing_hi, swing_lo, kup, kdn, bias, is_fx(symbol) or is_fx(name))
+        if sl is None or tp is None or entry is None:
+            continue
+        R = abs(entry - sl)
+        if R <= 0: 
+            continue
+        rr = abs(tp - entry) / R
+        if rr < 1.2:  # nới lỏng để có đủ trade
+            continue
+
+        fut = df_main.iloc[i+1:]
+        if len(fut) == 0:
+            break
+        fill = float(fut["open"].iloc[0])
+        outcome, bars = _first_hit_outcome(bias, entry, sl, tp, fut)
+        outR = 0.0
+        if outcome == "TP":
+            wins += 1; outR = rr
+        elif outcome == "SL":
+            losses += 1; outR = -1.0
+        else:
+            tout += 1; outR = 0.0
+        total_R += outR
+
+        rows.append({
+            "symbol": name, "tf": tf,
+            "signal_time": hist["datetime"].iloc[-1].isoformat(),
+            "side": bias, "entry": entry, "fill": fill, "sl": sl, "tp": tp,
+            "R": round(outR,3), "bars_to_outcome": bars, "outcome": outcome
+        })
+
+    # ghi CSV (append)
+    try:
+        need_hdr = not os.path.exists(BACKTEST_CSV_PATH)
+        with open(BACKTEST_CSV_PATH, "a", encoding="utf-8") as f:
+            if need_hdr:
+                f.write("symbol,tf,signal_time,side,entry,fill,sl,tp,R,bars_to_outcome,outcome\n")
+            for r in rows:
+                f.write("{symbol},{tf},{signal_time},{side},{entry},{fill},{sl},{tp},{R},{bars_to_outcome},{outcome}\n".format(**r))
+    except Exception as e:
+        logging.warning(f"[BT-OFF] CSV write failed: {e}")
+
+    trades = wins + losses + tout
+    winrate = (wins / max(1, wins + losses)) * 100.0 if (wins+losses)>0 else 0.0
+    expR = total_R / max(1, trades)
+    return {"symbol": name, "trades": trades, "win": wins, "loss": losses,
+            "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}
+
+def backtest_90d_offline():
+    MAIN_TF = os.getenv("MAIN_TF", "2h")
+    summary = []
+    for name, sym in symbols.items():
+        try:
+            res = backtest_90d_offline_for_symbol(name, sym, MAIN_TF)
+        except Exception as e:
+            logging.error(f"[BT-OFF] {name} failed: {e}")
+            res = {"symbol": name, "trades": 0, "win": 0, "loss": 0, "timeout": 0, "winrate": 0.0, "expR": 0.0}
+        summary.append(res)
+
+    lines = [f"📊 Backtest 90d (OFFLINE, {MAIN_TF}, no API):"]
+    for r in summary:
+        lines.append(f"- {r['symbol']}: {r['trades']} trades | W:{r['win']} L:{r['loss']} T:{r['timeout']} | Winrate {r['winrate']}% | ExpR {r['expR']}")
+    msg = "\n".join(lines)
+    logging.info(msg)
+    try:
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            send_telegram(msg)
+    except Exception:
+        pass
+# ======================= END BACKTEST 90D OFFLINE ==========================
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -1824,8 +2026,15 @@ def main():
         if valid_msg:
             msg = "\n".join(lines)
             send_telegram(msg)
+        # === Chạy backtest offline lúc 00:05 UTC nếu bật ===
+        if RUN_BACKTEST_OFFLINE:
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.hour == 0 and now_utc.minute == 5:
+                logging.info("[BT-OFF] Running daily offline backtest (no API)...")
+                backtest_90d_offline()
         else:
             print("🚫 Tất cả đều N/A, không gửi Telegram")
+            
     except Exception:
         logging.error(traceback.format_exc())
 if __name__ == "__main__":
