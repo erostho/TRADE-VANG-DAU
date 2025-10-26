@@ -2029,7 +2029,7 @@ def main():
         # === Chạy backtest offline lúc 00:05 UTC nếu bật ===
         if RUN_BACKTEST_OFFLINE:
             now_utc = datetime.now(timezone.utc)
-            if now_utc.hour == 0 and now_utc.minute == 5:
+            if now_utc.hour == 0 and 4 <= now_utc.minute <= 10:
                 logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                 backtest_90d_offline()
         else:
