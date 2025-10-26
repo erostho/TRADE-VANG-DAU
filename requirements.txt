@@ -1,3 +1,5 @@
 pandas
 numpy
 requests
+pandas>=2.2
+pyarrow>=15.0
