@@ -2040,5 +2040,7 @@ def main():
                         logging.error(f"[BT-OFF] Error running backtest: {e}")   
         except Exception:
             logging.error(traceback.format_exc())
+    except Exception:
+            logging.error(traceback.format_exc())
 if __name__ == "__main__":
     main()
