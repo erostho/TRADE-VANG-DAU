@@ -1168,7 +1168,9 @@ def analyze_symbol(name, symbol, daily_cache):
     results = {}
     has_data = False
     fast_bear = False
-
+    block_reason = ""
+    if blocked_news: block_reason = f"NEWS: {news_msg}"
+    elif cb_on:      block_reason = "Circuit breaker cooling"
     # 1) Trend text theo nhóm khung như cũ (dùng strong_trend)
     for group, intervals in interval_groups.items():
         trends = []
@@ -1255,9 +1257,9 @@ def analyze_symbol(name, symbol, daily_cache):
     blocked_news, news_msg = news_blackout(name)
     stats = load_stats()
     cb_on  = is_circuit_breaker_on(stats)
-    block_reason = ""
-    if blocked_news: block_reason = f"NEWS: {news_msg}"
-    elif cb_on:      block_reason = "Circuit breaker cooling"
+    #block_reason = ""
+    #if blocked_news: block_reason = f"NEWS: {news_msg}"
+    #elif cb_on:      block_reason = "Circuit breaker cooling"
     # Áp dụng hysteresis & memory
     state = load_state()
     final_dir, final_conf = decide_with_memory(symbol, raw_dir, raw_conf, state)
