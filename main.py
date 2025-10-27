@@ -2026,12 +2026,15 @@ def main():
         if valid_msg:
             msg = "\n".join(lines)
             send_telegram(msg)
-        # === Chạy backtest offline lúc 00:05 UTC nếu bật ===
+        # === Chạy backtest offline lúc 12:05 UTC nếu bật ===
         if RUN_BACKTEST_OFFLINE:
-            now_utc = datetime.now(timezone.utc)
-            if now_utc.hour == 0 and 4 <= now_utc.minute <= 10:
-                logging.info("[BT-OFF] Running daily offline backtest (no API)...")
+        now_utc = datetime.now(timezone.utc)
+        if now_utc.hour == 5 and 4 <= now_utc.minute <= 10:
+            logging.info("[BT-OFF] Running daily offline backtest (no API)...")
+            try:
                 backtest_90d_offline()
+            except Exception as e:
+                logging.error(f"[BT-OFF] Error running backtest: {e}")
         else:
             print("🚫 Tất cả đều N/A, không gửi Telegram")
             
