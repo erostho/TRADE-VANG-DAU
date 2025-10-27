@@ -477,8 +477,11 @@ def compute_lot_size(entry, sl, symbol, name, risk_pct=0.005):
 
     lots = risk_money / max(1e-9, (dist * value_per_point))
     # hiệu chỉnh theo leverage nếu cần
-    lots = lots / max(1.0, LEVERAGE)
-
+    #lots = lots / max(1.0, LEVERAGE)
+    # Theo chuẩn risk-by-SL không cần chia theo leverage.
+    # Nếu muốn cực kỳ bảo thủ, bật ENV APPLY_LEVERAGE_ON_SIZE=1
+    if os.getenv("APPLY_LEVERAGE_ON_SIZE", "0") == "1":
+        lots = lots / max(1.0, LEVERAGE)
     # kẹp biên
     if np.isnan(lots) or lots <= 0:
         lots = MIN_LOT
