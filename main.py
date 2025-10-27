@@ -1169,10 +1169,10 @@ def analyze_symbol(name, symbol, daily_cache):
     has_data = False
     fast_bear = False
     block_reason = ""
-    reasons = []              # để lưu các lý do lọc nâng cao
-    blocked_news = False
-    news_msg = ""
-    cb_on = False
+    reason: list[str] = []           # dùng 'reason' cho thống nhất
+    blocked_news: bool = False
+    news_msg: str = ""
+    cb_on: bool = False
     # 1) Trend text theo nhóm khung như cũ (dùng strong_trend)
     for group, intervals in interval_groups.items():
         trends = []
