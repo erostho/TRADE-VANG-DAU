@@ -1113,6 +1113,25 @@ def bias_invalidation(symbol: str, expect: str) -> bool:
     if expect == "SHORT":
         return (hist.gt(0).tail(3).all()) and (rsi15.tail(3).gt(50).all())
     return False
+
+def session_ok(name_or_sym: str, now_utc: datetime | None = None) -> bool:
+    """
+    Lọc phiên giao dịch theo sản phẩm để giảm nhiễu:
+    - XAU/WTI: 07:00–20:00 UTC (London+NY)
+    - USD/JPY (FX): (00:00–11:00) hoặc (12:00–19:00) UTC
+    - Crypto (BTC/ETH): tránh 02:00–06:00 UTC
+    """
+    up = (name_or_sym or "").upper()
+    now_utc = now_utc or datetime.now(timezone.utc)
+    h = now_utc.hour
+
+    if ("XAU" in up) or ("GOLD" in up) or ("CL" in up) or ("OIL" in up):
+        return 7 <= h <= 20
+    if ("USD/JPY" in up) or ("EUR/USD" in up):
+        return (0 <= h <= 11) or (12 <= h <= 19)
+    if ("BTC" in up) or ("ETH" in up):
+        return not (2 <= h <= 6)
+    return True
 # ==== FILTER HELPERS (thêm) ====
 def has_volume_spike(df, n=20, mult=1.2):
     """Volume nến đã ĐÓNG >= mult * MA(n). Nếu không có cột volume thì bỏ qua."""
@@ -1713,7 +1732,12 @@ def analyze_symbol(name, symbol, daily_cache):
         if entry is not None and sl is not None and tp is not None:
             if bias_invalidation(symbol, final_dir):
                 plan = "SIDEWAY"; entry = sl = tp = None; block_reason = "Bias invalidated intrabar"
-
+        # --- Session filter: chỉ trade trong giờ "sống" của từng sản phẩm ---
+        if entry is not None and sl is not None and tp is not None:
+            if not session_ok(name if name else symbol):
+                plan = "SIDEWAY"; entry = sl = tp = None
+                block_reason = "Out of trading session"
+        
         # === Position sizing ===
         if entry is not None and sl is not None and tp is not None:
             rpct = dynamic_risk_pct(final_conf, regime)
