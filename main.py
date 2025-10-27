@@ -1169,6 +1169,7 @@ def analyze_symbol(name, symbol, daily_cache):
     has_data = False
     fast_bear = False
     block_reason = ""
+    reason: list[str] = []
     if blocked_news: block_reason = f"NEWS: {news_msg}"
     elif cb_on:      block_reason = "Circuit breaker cooling"
     # 1) Trend text theo nhóm khung như cũ (dùng strong_trend)
