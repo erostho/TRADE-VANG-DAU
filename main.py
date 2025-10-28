@@ -1370,6 +1370,7 @@ def analyze_symbol(name, symbol, daily_cache):
             entry, sl, tp, align_note = apply_symbol_calibration(symbol, entry, sl, tp)
             if align_note:
                 logging.info(f"[ALIGN] {symbol} {align_note}")
+            reasons = []
 
         # === UPGRADE MR/TRADING FILTER 2025 =========================================
         # Mục tiêu:
@@ -1657,7 +1658,7 @@ def analyze_symbol(name, symbol, daily_cache):
             pass
         # === END UPGRADE MR/TRADING FILTER 2025 =====================================
         # ====== 5 FILTER NÂNG WINRATE ======
-        reasons = []
+        #reasons = []
         # 4H bias phải trùng hướng trade
         # ---- Soft filters: chấm điểm thay vì chặn cứng ----
         score_ok = 0
