@@ -1191,7 +1191,7 @@ def analyze_symbol(name, symbol, daily_cache):
     has_data = False
     fast_bear = False
     block_reason = ""
-    reason: list[str] = []           # dùng 'reason' cho thống nhất
+    reasons: list[str] = []           # dùng 'reason' cho thống nhất
     blocked_news: bool = False
     news_msg: str = ""
     cb_on: bool = False
