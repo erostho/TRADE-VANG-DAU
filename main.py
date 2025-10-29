@@ -1784,7 +1784,38 @@ def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
             d.sort_values("datetime").to_parquet(p, index=False)
     except Exception as e:
         logging.warning(f"[CACHE] save failed {symbol}-{interval}: {e}")
+import gdown
+import os
 
+GOOGLE_DRIVE_FOLDER = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"  # 👈 đổi thành ID của chị
+
+def upload_to_drive(local_path):
+    """Upload file cache lên Google Drive"""
+    try:
+        cmd = f"gdown --folder https://drive.google.com/drive/folders/{GOOGLE_DRIVE_FOLDER} -q --no-clobber"
+        os.system(cmd)
+        gdown.upload(local_path, GOOGLE_DRIVE_FOLDER, quiet=True)
+        logging.info(f"✅ Uploaded cache file {os.path.basename(local_path)} lên Google Drive")
+    except Exception as e:
+        logging.error(f"❌ Upload cache thất bại: {e}")
+
+
+def download_from_drive(symbol: str, interval: str) -> str:
+    """Tải file cache từ Drive (nếu có)"""
+    safe_name = symbol.upper().replace("/", "-")
+    file_name = f"{safe_name}_{interval}.parquet"
+    local_path = os.path.join(CANDLE_CACHE_DIR, file_name)
+
+    try:
+        url = f"https://drive.google.com/uc?id={GOOGLE_DRIVE_FOLDER}"
+        gdown.download_folder(f"https://drive.google.com/drive/folders/{GOOGLE_DRIVE_FOLDER}", quiet=True)
+        if os.path.exists(local_path):
+            logging.info(f"✅ Đã tải cache {file_name} từ Google Drive về.")
+            return local_path
+    except Exception as e:
+        logging.warning(f"⚠️ Không tải được cache {file_name} từ Drive: {e}")
+
+    return None
 def load_candles_local(symbol: str, interval: str, min_days: int = 90) -> pd.DataFrame | None:
     """Chỉ đọc file local; KHÔNG gọi API. Trả về df tối thiểu ~min_days (nếu đủ)."""
     try:
@@ -1852,6 +1883,18 @@ def _bt_sideway_block_offline(df2h: pd.DataFrame, name_or_sym: str) -> bool:
 
 def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None):
     df = load_candles_local(symbol, "2h", min_days=95)
+    # 🧩 Bắt đầu xử lý cache Google Drive
+    local_file = download_from_drive(symbol, "2h")
+    
+    if local_file and os.path.exists(local_file):
+        logging.info(f"✅ Dùng cache local từ Google Drive cho {symbol}")
+        df = pd.read_parquet(local_file)
+    else:
+        logging.info(f"⚠️ Không có cache Google Drive, tải API cho {symbol}")
+        df = load_candles_local(symbol, "2h", min_days=95)  # hoặc hàm tải nến gốc của chị
+        save_candles_to_disk(symbol, "2h", df)
+        upload_to_drive(f"{CANDLE_CACHE_DIR}/{symbol.replace('/', '-')}_2h.parquet")
+    # 🧩 Kết thúc xử lý cache Google Drive
     logging.info(f"[BT-OFF] {symbol} cache: {len(df)} nến | {df['datetime'].min()} -> {df['datetime'].max()}")
     tf = main_tf or os.getenv("MAIN_TF", "2h")
     # CHỈ đọc local, tuyệt đối không gọi API
