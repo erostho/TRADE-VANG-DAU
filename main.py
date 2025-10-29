@@ -1753,7 +1753,7 @@ def analyze_symbol(name, symbol, daily_cache):
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots, block_reason
 # ================= OFFLINE CANDLE CACHE (no API backtest) =================
-CANDLE_CACHE_DIR = os.getenv("CANDLE_CACHE_DIR", "/tmp/candles_cache")
+CANDLE_CACHE_DIR = os.getenv("CANDLE_CACHE_DIR", "/project/data/candles_cache")
 os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
 
 def _safe_name(x: str) -> str:
@@ -1851,8 +1851,9 @@ def _bt_sideway_block_offline(df2h: pd.DataFrame, name_or_sym: str) -> bool:
     return (np.isnan(a2) or a2 < 20) or (np.isnan(bw2) or bw2 < BW_MIN)
 
 def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None):
+    df = load_candles_local(symbol, "2h", min_days=95)
+    logging.info(f"[BT-OFF] {symbol} cache: {len(df)} nến | {df['datetime'].min()} -> {df['datetime'].max()}")
     tf = main_tf or os.getenv("MAIN_TF", "2h")
-
     # CHỈ đọc local, tuyệt đối không gọi API
     df_main = load_candles_local(symbol, tf, min_days=95)
     df_2h   = df_main if tf == "2h" else load_candles_local(symbol, "2h", min_days=95)
