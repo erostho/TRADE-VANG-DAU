@@ -1753,7 +1753,7 @@ def analyze_symbol(name, symbol, daily_cache):
     # Trả thêm 'final_conf' để in ra Telegram (nếu bạn muốn)
     return results, plan, entry, sl, tp, atrval, True, final_dir, int(round(final_conf)), lots, block_reason
 # ================= OFFLINE CANDLE CACHE (no API backtest) =================
-CANDLE_CACHE_DIR = os.getenv("CANDLE_CACHE_DIR", "/project/data/candles_cache")
+CANDLE_CACHE_DIR = os.getenv("CANDLE_CACHE_DIR", "/data/candles_cache")
 os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
 
 def _safe_name(x: str) -> str:
