@@ -1824,22 +1824,29 @@ def upload_to_drive(local_path: str):
         logging.error(f"❌ Upload cache thất bại: {e}")
 
 
-def download_from_drive(symbol: str, interval: str) -> str:
-    """Tải file cache từ Drive (nếu có)"""
-    safe_name = symbol.upper().replace("/", "-")
-    file_name = f"{safe_name}_{interval}.parquet"
-    local_path = os.path.join(CANDLE_CACHE_DIR, file_name)
-
+def download_from_drive(symbol: str, interval: str) -> str | None:
+    """Tải file cache từ Google Drive (nếu có)"""
     try:
-        url = f"https://drive.google.com/uc?id={GOOGLE_DRIVE_FOLDER}"
-        gdown.download_folder(f"https://drive.google.com/drive/folders/{GOOGLE_DRIVE_FOLDER}", quiet=True)
+        import gdown
+        safe_name = symbol.upper().replace("/", "-")
+        file_name = f"{safe_name}_{interval}.parquet"
+        local_path = os.path.join(CANDLE_CACHE_DIR, file_name)
+        file_id = GOOGLE_DRIVE_FOLDER_ID  # ID thư mục Drive (từ ENV)
+
+        # Tạo link dạng direct download (chỉ tải 1 file cụ thể)
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, local_path, quiet=True)
+
         if os.path.exists(local_path):
             logging.info(f"✅ Đã tải cache {file_name} từ Google Drive về.")
             return local_path
-    except Exception as e:
-        logging.warning(f"⚠️ Không tải được cache {file_name} từ Drive: {e}")
+        else:
+            logging.warning(f"⚠️ Không tìm thấy file {file_name} trên Drive.")
+            return None
 
-    return None
+    except Exception as e:
+        logging.warning(f"⚠️ Không tải được cache từ Drive: {e}")
+        return None
 def load_candles_local(symbol: str, interval: str, min_days: int = 90) -> pd.DataFrame | None:
     """Chỉ đọc file local; KHÔNG gọi API. Trả về df tối thiểu ~min_days (nếu đủ)."""
     try:
