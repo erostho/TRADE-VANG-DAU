@@ -6,7 +6,12 @@ import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone, timedelta
-
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from oauth2client.service_account import ServiceAccountCredentials
+import json, os, logging
+import gdown
+from pydrive2.auth import ServiceAccountCredentials
 # ================ LOGGING ================
 logging.basicConfig(
     level=logging.INFO,
@@ -1784,69 +1789,91 @@ def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
             d.sort_values("datetime").to_parquet(p, index=False)
     except Exception as e:
         logging.warning(f"[CACHE] save failed {symbol}-{interval}: {e}")
-import gdown
-import os
+
 
 GOOGLE_DRIVE_FOLDER_ID = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"  # 👈 đổi thành ID của chị
 
-import requests
-
-from pydrive2.auth import GoogleAuth
-from pydrive2.drive import GoogleDrive
-from pydrive2.auth import ServiceAccountCredentials
-import json, os, logging
 
 def upload_to_drive(local_path: str):
-    """Upload file cache lên Google Drive (dùng Service Account JSON từ biến môi trường)"""
-    json_data = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-    os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
-
-    if not json_data or not folder_id:
-        logging.warning("⚠️ Chưa có JSON hoặc FOLDER_ID, bỏ qua upload")
-        return
-
+    """Upload file cache lên Google Drive bằng service account JSON trong ENV."""
     try:
-        credentials_dict = json.loads(json_data)
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(
-            credentials_dict,
-            scopes=["https://www.googleapis.com/auth/drive.file"]
-        )
+        # 0) Kiểm tra path
+        if not local_path or not os.path.exists(local_path):
+            logging.warning(f"⚠️ File local không tồn tại, bỏ qua upload: {local_path}")
+            return
+
+        folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+        json_data = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+        if not folder_id:
+            logging.error("❌ Thiếu GOOGLE_DRIVE_FOLDER_ID")
+            return
+        if not json_data:
+            logging.error("❌ Thiếu GOOGLE_SERVICE_ACCOUNT_JSON")
+            return
+
+        # 1) Parse JSON & tạo credentials
+        try:
+            credentials_dict = json.loads(json_data)
+        except Exception as e:
+            logging.error(f"❌ JSON service account không hợp lệ: {e}")
+            return
+
+        scopes = ["https://www.googleapis.com/auth/drive.file"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_dict, scopes=scopes)
+
+        # 2) Auth & tạo Drive client
         gauth = GoogleAuth()
         gauth.credentials = creds
         drive = GoogleDrive(gauth)
 
-        file_name = os.path.basename(local_path)
-        gfile = drive.CreateFile({'title': file_name, 'parents': [{'id': folder_id}]})
+        # 3) Upload (tên file = tên gốc)
+        filename = os.path.basename(local_path)
+        gfile = drive.CreateFile({
+            "title": filename,
+            "parents": [{"id": folder_id}],
+        })
         gfile.SetContentFile(local_path)
-        gfile.Upload()
-        logging.info(f"✅ Uploaded {file_name} lên Google Drive thành công")
+        gfile.Upload()  # <- thực sự đưa file lên Drive
+
+        logging.info(f"✅ Upload cache thành công: {filename} → folder {folder_id}")
+
     except Exception as e:
         logging.error(f"❌ Upload cache thất bại: {e}")
 
-
 def download_from_drive(symbol: str, interval: str) -> str | None:
-    """Tải file cache từ Google Drive (nếu có)"""
+    """Kéo toàn bộ folder cache từ Drive về /tmp rồi lấy đúng file cần.
+       Yêu cầu: Folder trên Drive bật 'Anyone with the link (Viewer)'. """
     try:
-        import gdown
-        safe_name = symbol.upper().replace("/", "-")
-        file_name = f"{safe_name}_{interval}.parquet"
-        local_path = os.path.join(CANDLE_CACHE_DIR, file_name)
-        file_id = GOOGLE_DRIVE_FOLDER_ID  # ID thư mục Drive (từ ENV)
+        import os, subprocess
 
-        # Tạo link dạng direct download (chỉ tải 1 file cụ thể)
-        url = f"https://drive.google.com/uc?id={file_id}"
-        gdown.download(url, local_path, quiet=True)
-
-        if os.path.exists(local_path):
-            logging.info(f"✅ Đã tải cache {file_name} từ Google Drive về.")
-            return local_path
-        else:
-            logging.warning(f"⚠️ Không tìm thấy file {file_name} trên Drive.")
+        folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # ví dụ: 1dPxMrLoy73e...RgEQF
+        if not folder_id:
+            logging.warning("⚠️ Chưa set GOOGLE_DRIVE_FOLDER_ID trong ENV.")
             return None
 
+        # 1) Sync folder Drive -> local cache dir
+        folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+        os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
+        # tải toàn bộ folder (nhanh + đơn giản). Không cần cookies.
+        subprocess.run(
+            ["gdown", "--fuzzy", folder_url, "-O", CANDLE_CACHE_DIR, "-q"],
+            check=False
+        )
+
+        # 2) Tìm đúng file parquet theo quy tắc đặt tên local
+        fname = f"{_safe_name(symbol)}_{interval}.parquet"
+        local_path = os.path.join(CANDLE_CACHE_DIR, fname)
+
+        if os.path.exists(local_path):
+            logging.info(f"✅ Found cache from Drive: {local_path}")
+            return local_path
+
+        logging.warning(f"⚠️ Không thấy file sau khi sync: {fname}")
+        return None
+
     except Exception as e:
-        logging.warning(f"⚠️ Không tải được cache từ Drive: {e}")
+        logging.warning(f"⚠️ Drive sync failed: {e}")
         return None
 def load_candles_local(symbol: str, interval: str, min_days: int = 90) -> pd.DataFrame | None:
     """Chỉ đọc file local; KHÔNG gọi API. Trả về df tối thiểu ~min_days (nếu đủ)."""
