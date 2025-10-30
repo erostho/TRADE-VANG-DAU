@@ -1792,6 +1792,7 @@ def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
             merged.to_parquet(p, index=False)
         else:
             d.sort_values("datetime").to_parquet(p, index=False)
+        upload_to_drive(p)
     except Exception as e:
         logging.warning(f"[CACHE] save failed {symbol}-{interval}: {e}")
 
