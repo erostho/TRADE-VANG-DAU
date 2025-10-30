@@ -12,6 +12,11 @@ from oauth2client.service_account import ServiceAccountCredentials
 import json, os, logging
 import gdown
 from pydrive2.auth import ServiceAccountCredentials
+import os, logging, mimetypes
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 # ================ LOGGING ================
 logging.basicConfig(
     level=logging.INFO,
@@ -1793,51 +1798,65 @@ def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
 
 GOOGLE_DRIVE_FOLDER_ID = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"  # 👈 đổi thành ID của chị
 
+def _drive_creds_from_env():
+    client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN")
+    if not (client_id and client_secret and refresh_token):
+        logging.warning("⚠️ Thiếu CLIENT_ID/SECRET/REFRESH_TOKEN → bỏ qua upload")
+        return None
+    # access_token để trống; Google SDK sẽ tự refresh bằng refresh_token
+    creds = Credentials(
+        None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+    )
+    # chủ động refresh 1 lần cho chắc
+    try:
+        creds.refresh(Request())
+    except Exception as e:
+        logging.error(f"❌ Không refresh được token: {e}")
+        return None
+    return creds
 
 def upload_to_drive(local_path: str):
-    """Upload file cache lên Google Drive bằng service account JSON trong ENV."""
+    """Upload/Update file cache vào Google Drive (thư mục từ GOOGLE_DRIVE_FOLDER_ID)."""
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+    if not folder_id:
+        logging.warning("⚠️ Chưa có GOOGLE_DRIVE_FOLDER_ID → bỏ qua upload")
+        return
+    if not os.path.exists(local_path):
+        logging.error(f"❌ Upload cache thất bại: không thấy file {local_path}")
+        return
+
+    creds = _drive_creds_from_env()
+    if not creds:
+        return
+
+    service = build("drive", "v3", credentials=creds)
+    file_name = os.path.basename(local_path)
+    mime_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+
+    # Tìm xem file đã có trong folder chưa → nếu có thì update, không thì create
+    q = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
     try:
-        # 0) Kiểm tra path
-        if not local_path or not os.path.exists(local_path):
-            logging.warning(f"⚠️ File local không tồn tại, bỏ qua upload: {local_path}")
-            return
-
-        folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
-        json_data = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-
-        if not folder_id:
-            logging.error("❌ Thiếu GOOGLE_DRIVE_FOLDER_ID")
-            return
-        if not json_data:
-            logging.error("❌ Thiếu GOOGLE_SERVICE_ACCOUNT_JSON")
-            return
-
-        # 1) Parse JSON & tạo credentials
-        try:
-            credentials_dict = json.loads(json_data)
-        except Exception as e:
-            logging.error(f"❌ JSON service account không hợp lệ: {e}")
-            return
-
-        scopes = ["https://www.googleapis.com/auth/drive.file"]
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_dict, scopes=scopes)
-
-        # 2) Auth & tạo Drive client
-        gauth = GoogleAuth()
-        gauth.credentials = creds
-        drive = GoogleDrive(gauth)
-
-        # 3) Upload (tên file = tên gốc)
-        filename = os.path.basename(local_path)
-        gfile = drive.CreateFile({
-            "title": filename,
-            "parents": [{"id": folder_id}],
-        })
-        gfile.SetContentFile(local_path)
-        gfile.Upload()  # <- thực sự đưa file lên Drive
-
-        logging.info(f"✅ Upload cache thành công: {filename} → folder {folder_id}")
-
+        res = service.files().list(q=q, spaces="drive", fields="files(id,name)").execute()
+        files = res.get("files", [])
+        media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
+        if files:
+            file_id = files[0]["id"]
+            service.files().update(fileId=file_id, media_body=media).execute()
+            logging.info(f"✅ Đã cập nhật cache {file_name} lên Drive (update).")
+        else:
+            service.files().create(
+                body={"name": file_name, "parents": [folder_id]},
+                media_body=media,
+                fields="id",
+            ).execute()
+            logging.info(f"✅ Đã upload cache {file_name} lên Drive (create).")
     except Exception as e:
         logging.error(f"❌ Upload cache thất bại: {e}")
 
@@ -2167,7 +2186,7 @@ def main():
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 8 and 4 <= now_utc.minute <= 50:
+                if now_utc.hour == 14 and 4 <= now_utc.minute <= 50:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
