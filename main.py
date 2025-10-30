@@ -2140,7 +2140,7 @@ def main():
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 7 and 4 <= now_utc.minute <= 30:
+                if now_utc.hour == 7 and 4 <= now_utc.minute <= 50:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
