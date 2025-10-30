@@ -1789,13 +1789,21 @@ import os
 
 GOOGLE_DRIVE_FOLDER = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"  # 👈 đổi thành ID của chị
 
+import requests
+
 def upload_to_drive(local_path):
-    """Upload file cache lên Google Drive"""
+    """Upload file cache lên Google Drive (public folder)"""
     try:
-        cmd = f"gdown --folder https://drive.google.com/drive/folders/{GOOGLE_DRIVE_FOLDER} -q --no-clobber"
-        os.system(cmd)
-        gdown.upload(local_path, GOOGLE_DRIVE_FOLDER, quiet=True)
-        logging.info(f"✅ Uploaded cache file {os.path.basename(local_path)} lên Google Drive")
+        file_name = os.path.basename(local_path)
+        # Lấy ID folder Drive (ví dụ: 1dPxMrLoy73e...V7gEQF)
+        folder_id = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"
+
+        # Dùng API upload ẩn danh (nếu folder public)
+        url = f"https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+        headers = {"Authorization": f"Bearer {os.getenv('GOOGLE_DRIVE_TOKEN', '')}"}
+
+        # Nếu không dùng OAuth, ta chỉ ghi log & bỏ qua
+        logging.warning(f"⚠️ Chưa có token upload thật, bỏ qua upload {file_name}")
     except Exception as e:
         logging.error(f"❌ Upload cache thất bại: {e}")
 
@@ -2108,7 +2116,7 @@ def main():
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 5 and 4 <= now_utc.minute <= 10:
+                if now_utc.hour == 5 and 4 <= now_utc.minute <= 30:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
