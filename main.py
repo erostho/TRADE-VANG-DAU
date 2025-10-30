@@ -1831,65 +1831,52 @@ def _drive_creds_from_env():
 
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID')  # đã set trên Render
-
 def _drive_service():
-    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    """Tạo Drive service từ service account (ưu tiên môi trường)."""
+    sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not sa_json:
+        raise FileNotFoundError("❌ Thiếu biến GOOGLE_SERVICE_ACCOUNT_JSON trong môi trường!")
+
+    info = json.loads(sa_json)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build('drive', 'v3', credentials=creds)
 
 def upload_to_drive(local_path: str):
-    if not os.path.exists(local_path):
-        logging.warning(f"[CACHE] Local file không tồn tại: {local_path}")
-        return
+    try:
+        if not os.path.exists(local_path):
+            logging.warning(f"[CACHE] Local file không tồn tại: {local_path}")
+            return
 
-    file_name = os.path.basename(local_path)
-    svc = _drive_service()
+        file_name = os.path.basename(local_path)
+        service = _drive_service()
 
-    # 🔎 Tìm file TRONG FOLDER
-    q = f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false"
-    res = svc.files().list(q=q, spaces='drive', fields='files(id, name, parents)').execute()
-    items = res.get('files', [])
+        # 🔍 Tìm file trùng tên trong folder
+        query = f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false"
+        res = service.files().list(q=query, fields="files(id, name)").execute()
+        files = res.get("files", [])
 
-    media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
+        media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
 
-    if items:
-        # 🟡 Update nội dung file có sẵn trong folder
-        file_id = items[0]['id']
-        svc.files().update(fileId=file_id, media_body=media).execute()
-        logging.info(f"🟡 Đã cập nhật cache {file_name} lên Drive (update).")
-    else:
-        # Có thể file tồn tại ở ROOT (sai folder) → tìm thêm ở My Drive
-        res2 = svc.files().list(
-            q=f"name='{file_name}' and trashed=false",
-            spaces='drive', fields='files(id, parents)'
-        ).execute()
-        anywhere = res2.get('files', [])
-
-        if anywhere:
-            # ➜ Move file đó vào đúng folder rồi update
-            file_id = anywhere[0]['id']
-            # Lấy parents cũ để remove (nếu có)
-            parents_old = ",".join(anywhere[0].get('parents', []))
-            svc.files().update(
-                fileId=file_id,
-                addParents=FOLDER_ID,
-                removeParents=parents_old if parents_old else None
-            ).execute()
-            svc.files().update(fileId=file_id, media_body=media).execute()
-            logging.info(f"🟡 Đã di chuyển & cập nhật cache {file_name} vào folder (update).")
+        if files:
+            file_id = files[0]['id']
+            service.files().update(fileId=file_id, media_body=media).execute()
+            logging.info(f"🟡 Đã cập nhật cache {file_name} lên Drive (update).")
         else:
-            # 🟢 Tạo mới TRỰC TIẾP TRONG FOLDER
             meta = {'name': file_name, 'parents': [FOLDER_ID]}
-            svc.files().create(body=meta, media_body=media, fields='id').execute()
+            service.files().create(body=meta, media_body=media, fields='id').execute()
             logging.info(f"🟢 Đã upload cache {file_name} lên Drive (create).")
 
-    # ✅ Verify lại ngay TRONG FOLDER (đỡ cảnh 'không thấy file sau sync')
-    time.sleep(1.5)  # cho Drive index 1 nhịp
-    check = svc.files().list(
-        q=f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false",
-        spaces='drive', fields='files(id)'
-    ).execute().get('files', [])
-    if not check:
-        logging.warning(f"⚠️ Không thấy file sau khi sync: {file_name} (kiểm tra FOLDER_ID & quyền).")
+        # ✅ Xác thực lại file tồn tại
+        time.sleep(1)
+        check = service.files().list(
+            q=f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false",
+            fields="files(id)"
+        ).execute().get("files", [])
+        if not check:
+            logging.warning(f"⚠️ Không thấy file sau khi sync: {file_name}")
+
+    except Exception as e:
+        logging.warning(f"[CACHE] save failed {os.path.basename(local_path)}: {e}")
 
 def download_from_drive(symbol: str, interval: str) -> str | None:
     """Kéo toàn bộ folder cache từ Drive về /tmp rồi lấy đúng file cần.
