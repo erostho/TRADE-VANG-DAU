@@ -1,3 +1,4 @@
+import re
 import os
 import time
 import json
@@ -17,6 +18,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import os, time, logging
 # ================ LOGGING ================
 logging.basicConfig(
     level=logging.INFO,
@@ -1766,8 +1768,12 @@ def analyze_symbol(name, symbol, daily_cache):
 CANDLE_CACHE_DIR = os.getenv("CANDLE_CACHE_DIR", "/tmp/candles_cache")
 os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
 
+
 def _safe_name(x: str) -> str:
-    return x.upper().replace("/", "_").replace(" ", "_")
+    s = x.upper()
+    s = re.sub(r'[^A-Z0-9]+', '_', s)   # mọi thứ không phải A-Z0-9 -> _
+    s = s.strip('_')
+    return s
 
 def _cache_file(symbol: str, interval: str) -> str:
     return os.path.join(CANDLE_CACHE_DIR, f"{_safe_name(symbol)}__{interval}.parquet")
@@ -1823,43 +1829,67 @@ def _drive_creds_from_env():
         return None
     return creds
 
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+FOLDER_ID = os.getenv('GOOGLE_DRIVE_FOLDER_ID')  # đã set trên Render
+
+def _drive_service():
+    creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    return build('drive', 'v3', credentials=creds)
+
 def upload_to_drive(local_path: str):
-    """Upload/Update file cache vào Google Drive (thư mục từ GOOGLE_DRIVE_FOLDER_ID)."""
-    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-    if not folder_id:
-        logging.warning("⚠️ Chưa có GOOGLE_DRIVE_FOLDER_ID → bỏ qua upload")
-        return
     if not os.path.exists(local_path):
-        logging.error(f"❌ Upload cache thất bại: không thấy file {local_path}")
+        logging.warning(f"[CACHE] Local file không tồn tại: {local_path}")
         return
 
-    creds = _drive_creds_from_env()
-    if not creds:
-        return
-
-    service = build("drive", "v3", credentials=creds)
     file_name = os.path.basename(local_path)
-    mime_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+    svc = _drive_service()
 
-    # Tìm xem file đã có trong folder chưa → nếu có thì update, không thì create
-    q = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
-    try:
-        res = service.files().list(q=q, spaces="drive", fields="files(id,name)").execute()
-        files = res.get("files", [])
-        media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
-        if files:
-            file_id = files[0]["id"]
-            service.files().update(fileId=file_id, media_body=media).execute()
-            logging.info(f"✅ Đã cập nhật cache {file_name} lên Drive (update).")
-        else:
-            service.files().create(
-                body={"name": file_name, "parents": [folder_id]},
-                media_body=media,
-                fields="id",
+    # 🔎 Tìm file TRONG FOLDER
+    q = f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false"
+    res = svc.files().list(q=q, spaces='drive', fields='files(id, name, parents)').execute()
+    items = res.get('files', [])
+
+    media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
+
+    if items:
+        # 🟡 Update nội dung file có sẵn trong folder
+        file_id = items[0]['id']
+        svc.files().update(fileId=file_id, media_body=media).execute()
+        logging.info(f"🟡 Đã cập nhật cache {file_name} lên Drive (update).")
+    else:
+        # Có thể file tồn tại ở ROOT (sai folder) → tìm thêm ở My Drive
+        res2 = svc.files().list(
+            q=f"name='{file_name}' and trashed=false",
+            spaces='drive', fields='files(id, parents)'
+        ).execute()
+        anywhere = res2.get('files', [])
+
+        if anywhere:
+            # ➜ Move file đó vào đúng folder rồi update
+            file_id = anywhere[0]['id']
+            # Lấy parents cũ để remove (nếu có)
+            parents_old = ",".join(anywhere[0].get('parents', []))
+            svc.files().update(
+                fileId=file_id,
+                addParents=FOLDER_ID,
+                removeParents=parents_old if parents_old else None
             ).execute()
-            logging.info(f"✅ Đã upload cache {file_name} lên Drive (create).")
-    except Exception as e:
-        logging.error(f"❌ Upload cache thất bại: {e}")
+            svc.files().update(fileId=file_id, media_body=media).execute()
+            logging.info(f"🟡 Đã di chuyển & cập nhật cache {file_name} vào folder (update).")
+        else:
+            # 🟢 Tạo mới TRỰC TIẾP TRONG FOLDER
+            meta = {'name': file_name, 'parents': [FOLDER_ID]}
+            svc.files().create(body=meta, media_body=media, fields='id').execute()
+            logging.info(f"🟢 Đã upload cache {file_name} lên Drive (create).")
+
+    # ✅ Verify lại ngay TRONG FOLDER (đỡ cảnh 'không thấy file sau sync')
+    time.sleep(1.5)  # cho Drive index 1 nhịp
+    check = svc.files().list(
+        q=f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false",
+        spaces='drive', fields='files(id)'
+    ).execute().get('files', [])
+    if not check:
+        logging.warning(f"⚠️ Không thấy file sau khi sync: {file_name} (kiểm tra FOLDER_ID & quyền).")
 
 def download_from_drive(symbol: str, interval: str) -> str | None:
     """Kéo toàn bộ folder cache từ Drive về /tmp rồi lấy đúng file cần.
