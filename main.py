@@ -1952,7 +1952,7 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         logging.info(f"⚠️ Không có cache Google Drive, tải API cho {symbol}")
         df = load_candles_local(symbol, "2h", min_days=95)  # hoặc hàm tải nến gốc của chị
         save_candles_to_disk(symbol, "2h", df)
-        upload_to_drive(f"{CANDLE_CACHE_DIR}/{symbol.replace('/', '-')}_2h.parquet")
+        upload_to_drive(_cache_file(symbol, "2h"))
     # 🧩 Kết thúc xử lý cache Google Drive
     logging.info(f"[BT-OFF] {symbol} cache: {len(df)} nến | {df['datetime'].min()} -> {df['datetime'].max()}")
     tf = main_tf or os.getenv("MAIN_TF", "2h")
