@@ -1787,7 +1787,7 @@ def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
 import gdown
 import os
 
-GOOGLE_DRIVE_FOLDER = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"  # 👈 đổi thành ID của chị
+GOOGLE_DRIVE_FOLDER_ID = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"  # 👈 đổi thành ID của chị
 
 import requests
 
@@ -2140,7 +2140,7 @@ def main():
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 7 and 4 <= now_utc.minute <= 50:
+                if now_utc.hour == 8 and 4 <= now_utc.minute <= 50:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
