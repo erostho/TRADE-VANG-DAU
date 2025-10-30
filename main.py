@@ -10,7 +10,6 @@ from datetime import datetime, timezone, timedelta
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
-import json, os, logging
 import gdown
 from pydrive2.auth import ServiceAccountCredentials
 import os, logging, mimetypes
@@ -18,7 +17,8 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-import os, time, logging
+import os, json, logging, time
+from google.oauth2 import service_account   # <-- BẮT BUỘC
 # ================ LOGGING ================
 logging.basicConfig(
     level=logging.INFO,
@@ -1836,7 +1836,6 @@ def _drive_service():
     sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not sa_json:
         raise FileNotFoundError("❌ Thiếu biến GOOGLE_SERVICE_ACCOUNT_JSON trong môi trường!")
-
     info = json.loads(sa_json)
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build('drive', 'v3', credentials=creds)
