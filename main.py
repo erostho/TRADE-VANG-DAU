@@ -1791,19 +1791,35 @@ GOOGLE_DRIVE_FOLDER = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"  # 👈
 
 import requests
 
-def upload_to_drive(local_path):
-    """Upload file cache lên Google Drive (public folder)"""
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from pydrive2.auth import ServiceAccountCredentials
+import json, os, logging
+
+def upload_to_drive(local_path: str):
+    """Upload file cache lên Google Drive (dùng Service Account JSON từ biến môi trường)"""
+    json_data = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+
+    if not json_data or not folder_id:
+        logging.warning("⚠️ Chưa có JSON hoặc FOLDER_ID, bỏ qua upload")
+        return
+
     try:
+        credentials_dict = json.loads(json_data)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            credentials_dict,
+            scopes=["https://www.googleapis.com/auth/drive.file"]
+        )
+        gauth = GoogleAuth()
+        gauth.credentials = creds
+        drive = GoogleDrive(gauth)
+
         file_name = os.path.basename(local_path)
-        # Lấy ID folder Drive (ví dụ: 1dPxMrLoy73e...V7gEQF)
-        folder_id = "1dPxMrLoy73et8rJDjpC7TDaOGv7RgEQF?usp=drive_link"
-
-        # Dùng API upload ẩn danh (nếu folder public)
-        url = f"https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-        headers = {"Authorization": f"Bearer {os.getenv('GOOGLE_DRIVE_TOKEN', '')}"}
-
-        # Nếu không dùng OAuth, ta chỉ ghi log & bỏ qua
-        logging.warning(f"⚠️ Chưa có token upload thật, bỏ qua upload {file_name}")
+        gfile = drive.CreateFile({'title': file_name, 'parents': [{'id': folder_id}]})
+        gfile.SetContentFile(local_path)
+        gfile.Upload()
+        logging.info(f"✅ Uploaded {file_name} lên Google Drive thành công")
     except Exception as e:
         logging.error(f"❌ Upload cache thất bại: {e}")
 
@@ -2116,7 +2132,7 @@ def main():
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 5 and 4 <= now_utc.minute <= 30:
+                if now_utc.hour == 7 and 4 <= now_utc.minute <= 30:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
