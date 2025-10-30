@@ -4,3 +4,4 @@ requests
 pandas>=2.2
 pyarrow>=15.0
 gdown
+pydrive2
