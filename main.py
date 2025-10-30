@@ -1800,6 +1800,7 @@ def upload_to_drive(local_path: str):
     """Upload file cache lên Google Drive (dùng Service Account JSON từ biến môi trường)"""
     json_data = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+    os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
 
     if not json_data or not folder_id:
         logging.warning("⚠️ Chưa có JSON hoặc FOLDER_ID, bỏ qua upload")
