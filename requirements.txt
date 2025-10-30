@@ -5,3 +5,6 @@ pandas>=2.2
 pyarrow>=15.0
 gdown
 pydrive2
+google-api-python-client>=2.137.0
+google-auth>=2.35.0
+google-auth-httplib2>=0.2.0
