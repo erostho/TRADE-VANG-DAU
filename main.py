@@ -2031,13 +2031,12 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
             continue
 
         bias = strong_trend(hist)
-        if bias not in ("LONG","SHORT"):
+        regime = "TREND" if bias in ("LONG","SHORT") else "RANGE"
+        confidence = 1.0
+        
+        # Lọc toggle
+        if (regime == "RANGE" and not ALLOW_RANGE_IN_BACKTEST) or (confidence < CONF_MIN_BACKTEST):
             continue
-        if _bt_sideway_block_offline(df_2h.iloc[:i+1] if df_2h is not None else None, name or symbol):
-            continue
-        # === regime & confidence for backtest ===
-        regime = "TREND" if bias in ("LONG", "SHORT") else "RANGE"
-        confidence = 1.0  # nếu sau này có hàm tính conf thì gán thật ở đây
         
         # Lọc theo toggle
         if (regime == "RANGE" and not ALLOW_RANGE_IN_BACKTEST) or (confidence < CONF_MIN_BACKTEST):
@@ -2081,7 +2080,7 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
             "signal_time": hist["datetime"].iloc[-1].isoformat(),
             "side": bias, "entry": entry, "fill": fill, "sl": sl, "tp": tp,
             "regime": regime, "confidence": confidence,
-            "R": round(outR,3), "bars_to_outcome": bars, "outcome": outcome, "regime": regime,
+            "R": round(outR,3), "bars_to_outcome": bars, "outcome": outcome
         })
 
     # ghi CSV (append)
@@ -2100,10 +2099,8 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         losses = sum(1 for r in subrows if r["outcome"] == "Sl" or r["outcome"] == "SL")
         tout   = sum(1 for r in subrows if r["outcome"] not in ("TP","Sl","SL","Tp"))
         winrate = (wins / max(1, wins + losses)) * 100.0 if (wins + losses) > 0 else 0.0
-        expR = sum((r["R"] if r["outcome"] in ("TP","Tp") else (-1.0 if r["outcome"] in ("SL","Sl") else 0.0))
-                   for r in subrows) / max(1, trades)
-        return {"trades": trades, "win": wins, "loss": losses,
-                "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}  
+        expR = sum((r["R"] if r["outcome"] in ("TP","Tp") else (-1.0 if r["outcome"] in ("SL","Sl") else 0.0)) for r in subrows) / max(1, trades)
+        return {"trades": trades, "win": wins, "loss": losses, "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}  
     trend_rows = [r for r in rows if r.get("regime") == "TREND"]
     range_rows = [r for r in rows if r.get("regime") == "RANGE"] 
     trend_stat = _stats(trend_rows)
@@ -2112,6 +2109,8 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
     trades = wins + losses + tout
     winrate = (wins / max(1, wins + losses)) * 100.0 if (wins+losses)>0 else 0.0
     expR = total_R / max(1, trades)
+    res["trend"] = trend_stat
+    res["range"] = range_stat
     return {
         "symbol": name,
         "trades": trades, "win": wins, "loss": losses, "timeout": tout,
@@ -2260,7 +2259,7 @@ def main():
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 6 and 4 <= now_utc.minute <= 55:
+                if now_utc.hour == 7 and 4 <= now_utc.minute <= 55:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
