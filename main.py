@@ -2034,13 +2034,13 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         regime = "TREND" if bias in ("LONG","SHORT") else "RANGE"
         confidence = 1.0
         
-        # 👉 TÍNH KELTNER TRƯỚC ĐÃ
+        # TÍNH KELTNER TRƯỚC
         try:
             km, kup, kdn = keltner_mid(hist, 20, atr_mult=1.0)
         except Exception:
             km = kup = kdn = np.nan
         
-        # 👉 RANGE: tự xác định side theo biên
+        # RANGE: gán side bằng biên kênh để có SL/TP
         if regime == "RANGE":
             px = float(hist["close"].iloc[-1])
             if not np.isnan(kup) and px >= kup:
@@ -2048,22 +2048,16 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
             elif not np.isnan(kdn) and px <= kdn:
                 bias = "LONG"
             else:
-                # chưa chạm biên → bỏ qua nến này
+                # chưa chạm biên -> bỏ qua nến này
                 continue
         
-        # (nếu muốn) choppy filter CHỈ cho TREND
-        # if regime == "TREND" and _bt_sideway_block_offline(...): continue
+        # ✅ BÂY GIỜ mới kiểm tra side hợp lệ
+        if bias not in ("LONG","SHORT"):
+            continue
         
         entry = float(hist["close"].iloc[-1])
         atrv = atr(hist, 14)
         swing_hi, swing_lo = swing_levels(hist, 20)
-
-        # Keltner/Donchian trên chính tf
-        try:
-            km, kup, kdn = keltner_mid(hist, 20, atr_mult=1.0)
-        except Exception:
-            km = kup = kdn = np.nan
-
         sl, tp = smart_sl_tp(entry, atrv, swing_hi, swing_lo, kup, kdn, bias, is_fx(symbol) or is_fx(name))
         if sl is None or tp is None or entry is None:
             continue
@@ -2087,7 +2081,7 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         else:
             tout += 1; outR = 0.0
         total_R += outR
-        regime = "TREND" if str(bias).upper() in ("LONG", "SHORT") else "RANGE"
+        #regime = "TREND" if str(bias).upper() in ("LONG", "SHORT") else "RANGE"
         rows.append({
             "symbol": name, "tf": tf,
             "signal_time": hist["datetime"].iloc[-1].isoformat(),
