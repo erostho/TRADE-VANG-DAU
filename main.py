@@ -2033,14 +2033,21 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         bias = strong_trend(hist)
         regime = "TREND" if bias in ("LONG","SHORT") else "RANGE"
         confidence = 1.0
-        
-        # Lọc toggle
-        if (regime == "RANGE" and not ALLOW_RANGE_IN_BACKTEST) or (confidence < CONF_MIN_BACKTEST):
-            continue
-        
         # Lọc theo toggle
         if (regime == "RANGE" and not ALLOW_RANGE_IN_BACKTEST) or (confidence < CONF_MIN_BACKTEST):
             continue
+        # Chỉ áp choppy filter cho TREND (nếu có)
+        # if regime == "TREND" and _bt_sideway_block_offline(...): continue
+        # ✅ RANGE: tự xác định side để có LONG/SHORT cho SL/TP
+        if regime == "RANGE":
+            px = float(hist["close"].iloc[-1])
+            if not np.isnan(kup) and px >= kup:
+                bias = "SHORT"
+            elif not np.isnan(kdn) and px <= kdn:
+                bias = "LONG"
+            else:
+                # chưa chạm biên – không trade RANGE ở nến này
+                continue    
         entry = float(hist["close"].iloc[-1])  # close của nến -2
         atrv  = atr(hist, 14)
         swing_hi, swing_lo = swing_levels(hist, 20)
