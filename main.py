@@ -1842,42 +1842,33 @@ def _drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def upload_to_drive(local_path: str):
-    """Upload/Update file cache vào Google Drive (thư mục từ GOOGLE_DRIVE_FOLDER_ID)."""
-    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
-    if not folder_id:
-        logging.warning("⚠️ Chưa có GOOGLE_DRIVE_FOLDER_ID → bỏ qua upload")
-        return
-    if not os.path.exists(local_path):
-        logging.error(f"❌ Upload cache thất bại: không thấy file {local_path}")
-        return
-
-    creds = _drive_creds_from_env()
-    if not creds:
-        return
-
-    service = build("drive", "v3", credentials=creds)
-    file_name = os.path.basename(local_path)
-    mime_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
-
-    # Tìm xem file đã có trong folder chưa → nếu có thì update, không thì create
-    q = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
     try:
-        res = service.files().list(q=q, spaces="drive", fields="files(id,name)").execute()
-        files = res.get("files", [])
-        media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
-        if files:
-            file_id = files[0]["id"]
-            service.files().update(fileId=file_id, media_body=media).execute()
-            logging.info(f"✅ Đã cập nhật cache {file_name} lên Drive (update).")
+        if not os.path.exists(local_path):
+            logging.warning(f"[CACHE] Local không tồn tại: {local_path}")
+            return
+
+        file_name = os.path.basename(local_path)
+        svc = _drive_service()
+
+        # ✅ Kiểm tra file cũ có tồn tại trong folder chưa
+        query = f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false"
+        existing = svc.files().list(q=query, fields="files(id)").execute().get("files", [])
+
+        media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
+
+        if existing:
+            # ✅ Nếu có file cũ → ghi đè (update)
+            file_id = existing[0]['id']
+            svc.files().update(fileId=file_id, media_body=media).execute()
+            logging.info(f"🟡 Đã cập nhật cache {file_name} lên Drive (update).")
         else:
-            service.files().create(
-                body={"name": file_name, "parents": [folder_id]},
-                media_body=media,
-                fields="id",
-            ).execute()
-            logging.info(f"✅ Đã upload cache {file_name} lên Drive (create).")
+            # ✅ Nếu chưa có → tạo mới
+            meta = {'name': file_name, 'parents': [FOLDER_ID]}
+            svc.files().create(body=meta, media_body=media, fields='id').execute()
+            logging.info(f"🟢 Đã upload cache {file_name} lên Drive (create).")
+
     except Exception as e:
-        logging.error(f"❌ Upload cache thất bại: {e}")
+        logging.warning(f"[CACHE] save failed {os.path.basename(local_path)}: {e}")
 
 
 def download_from_drive(symbol: str, interval: str) -> str | None:
@@ -2206,7 +2197,7 @@ def main():
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 2 and 4 <= now_utc.minute <= 50:
+                if now_utc.hour == 3 and 4 <= now_utc.minute <= 50:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
