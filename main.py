@@ -1770,10 +1770,11 @@ os.makedirs(CANDLE_CACHE_DIR, exist_ok=True)
 
 
 def _safe_name(x: str) -> str:
-    s = x.upper()
-    s = re.sub(r'[^A-Z0-9]+', '_', s)   # mọi thứ không phải A-Z0-9 -> _
-    s = s.strip('_')
-    return s
+    x = x.upper().replace("/", "_")
+    # Giữ nguyên 1 dấu gạch dưới nếu trùng
+    while "__" in x:
+        x = x.replace("__", "_")
+    return x
 
 def _cache_file(symbol: str, interval: str) -> str:
     return os.path.join(CANDLE_CACHE_DIR, f"{_safe_name(symbol)}__{interval}.parquet")
