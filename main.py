@@ -2202,11 +2202,11 @@ def main():
             send_telegram(msg)
         else:
             print("🚫 Tất cả đều N/A, không gửi Telegram")
-        # === Chạy backtest offline lúc 12:05 UTC nếu bật ===
+        # === Chạy backtest offline lúc 12:05 UTC nếu bật =5==
         try:
             if RUN_BACKTEST_OFFLINE:
                 now_utc = datetime.now(timezone.utc)
-                if now_utc.hour == 14 and 4 <= now_utc.minute <= 50:
+                if now_utc.hour == 2 and 4 <= now_utc.minute <= 50:
                     logging.info("[BT-OFF] Running daily offline backtest (no API)...")
                     try:
                         backtest_90d_offline()
