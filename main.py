@@ -1799,7 +1799,9 @@ def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
             merged.to_parquet(p, index=False)
         else:
             d.sort_values("datetime").to_parquet(p, index=False)
-        upload_to_drive(p)
+        # sau khi save Parquet xong
+        msg = upload_to_drive_overwrite(p, os.getenv("GOOGLE_DRIVE_FOLDER_ID"))
+        logging.info(f"✅ {msg}")
     except Exception as e:
         logging.warning(f"[CACHE] save failed {symbol}-{interval}: {e}")
 
@@ -1842,7 +1844,35 @@ def _drive_service():
     return build('drive', 'v3', credentials=creds)
 
 from googleapiclient.http import MediaFileUpload
+import os, json, requests
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
 
+def build_drive_with_oauth():
+    client_id     = os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+    access_token  = os.getenv("GOOGLE_OAUTH_ACCESS_TOKEN")
+    refresh_token = os.getenv("GOOGLE_OAUTH_REFRESH_TOKEN")
+
+    if not all([client_id, client_secret, access_token, refresh_token]):
+        raise RuntimeError("Thiếu biến OAuth (ID/SECRET/ACCESS/REFRESH).")
+
+    creds = Credentials(
+        token=access_token,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=["https://www.googleapis.com/auth/drive.file"]
+    )
+
+    # refresh nếu access_token hết hạn
+    if not creds.valid:
+        request = Request()
+        creds.refresh(request)
+
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
 def upload_to_drive_overwrite(local_path: str, drive_folder_id: str):
     service = build_drive_with_oauth()
     file_name = os.path.basename(local_path)
