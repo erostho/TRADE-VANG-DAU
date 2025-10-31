@@ -30,7 +30,6 @@ logging.basicConfig(
 API_KEY = os.getenv("TWELVE_DATA_KEY", "")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
 BASE_URL = "https://api.twelvedata.com/time_series"
 TIMEZ = os.getenv("TZ", "Asia/Ho_Chi_Minh")
 
@@ -43,7 +42,8 @@ from collections import deque
 
 # cache cho 1 lần chạy
 RUN_CACHE = {}
-
+ALLOW_RANGE_IN_BACKTEST = True
+CONF_MIN_BACKTEST = 0.55
 # token bucket đơn giản cho quota theo phút
 _last_min_calls = deque()   # lưu timestamps các call trong 60s gần nhất
 def _throttle():
@@ -2033,10 +2033,15 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         bias = strong_trend(hist)
         if bias not in ("LONG","SHORT"):
             continue
-
         if _bt_sideway_block_offline(df_2h.iloc[:i+1] if df_2h is not None else None, name or symbol):
             continue
-
+        # === regime & confidence for backtest ===
+        regime = "TREND" if bias in ("LONG", "SHORT") else "RANGE"
+        confidence = 1.0  # nếu sau này có hàm tính conf thì gán thật ở đây
+        
+        # Lọc theo toggle
+        if (regime == "RANGE" and not ALLOW_RANGE_IN_BACKTEST) or (confidence < CONF_MIN_BACKTEST):
+            continue
         entry = float(hist["close"].iloc[-1])  # close của nến -2
         atrv  = atr(hist, 14)
         swing_hi, swing_lo = swing_levels(hist, 20)
@@ -2075,6 +2080,7 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
             "symbol": name, "tf": tf,
             "signal_time": hist["datetime"].iloc[-1].isoformat(),
             "side": bias, "entry": entry, "fill": fill, "sl": sl, "tp": tp,
+            "regime": regime, "confidence": confidence,
             "R": round(outR,3), "bars_to_outcome": bars, "outcome": outcome
         })
 
@@ -2083,17 +2089,36 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         need_hdr = not os.path.exists(BACKTEST_CSV_PATH)
         with open(BACKTEST_CSV_PATH, "a", encoding="utf-8") as f:
             if need_hdr:
-                f.write("symbol,tf,signal_time,side,entry,fill,sl,tp,R,bars_to_outcome,outcome\n")
+                f.write("symbol,tf,signal_time,side,entry,fill,sl,tp,regime,confidence,R,bars_to_outcome,outcome\n")
             for r in rows:
-                f.write("{symbol},{tf},{signal_time},{side},{entry},{fill},{sl},{tp},{R},{bars_to_outcome},{outcome}\n".format(**r))
+                f.write("{symbol},{tf},{signal_time},{side},{entry},{fill},{sl},{tp},{regime},{confidence},{R},{bars_to_outcome},{outcome}\n".format(**r))
     except Exception as e:
         logging.warning(f"[BT-OFF] CSV write failed: {e}")
+    def _stats(subrows):
+        trades = len(subrows)
+        wins   = sum(1 for r in subrows if r["outcome"] == "Tp" or r["outcome"] == "TP")
+        losses = sum(1 for r in subrows if r["outcome"] == "Sl" or r["outcome"] == "SL")
+        tout   = sum(1 for r in subrows if r["outcome"] not in ("TP","Sl","SL","Tp"))
+        winrate = (wins / max(1, wins + losses)) * 100.0 if (wins + losses) > 0 else 0.0
+        expR = sum((r["R"] if r["outcome"] in ("TP","Tp") else (-1.0 if r["outcome"] in ("SL","Sl") else 0.0))
+                   for r in subrows) / max(1, trades)
+        return {"trades": trades, "win": wins, "loss": losses,
+                "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}
+    
+    trend_rows = [r for r in rows if r.get("regime") == "TREND"]
+    range_rows = [r for r in rows if r.get("regime") == "RANGE"] 
+    trend_stat = _stats(trend_rows)
+    range_stat = _stats(range_rows)
 
     trades = wins + losses + tout
     winrate = (wins / max(1, wins + losses)) * 100.0 if (wins+losses)>0 else 0.0
     expR = total_R / max(1, trades)
-    return {"symbol": name, "trades": trades, "win": wins, "loss": losses,
-            "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}
+    return {
+        "symbol": name,
+        "trades": trades, "win": wins, "loss": losses, "timeout": tout,
+        "winrate": round(winrate,1), "expR": round(expR,3),
+        "by_regime": {"TREND": trend_stat, "RANGE": range_stat}
+    }
 
 def backtest_90d_offline():
     MAIN_TF = os.getenv("MAIN_TF", "2h")
