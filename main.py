@@ -1841,34 +1841,34 @@ def _drive_service():
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build('drive', 'v3', credentials=creds)
 
-def upload_to_drive(local_path: str):
-    try:
-        if not os.path.exists(local_path):
-            logging.warning(f"[CACHE] Local không tồn tại: {local_path}")
-            return
+from googleapiclient.http import MediaFileUpload
 
-        file_name = os.path.basename(local_path)
-        svc = _drive_service()
+def upload_to_drive_overwrite(local_path: str, drive_folder_id: str):
+    service = build_drive_with_oauth()
+    file_name = os.path.basename(local_path)
 
-        # ✅ Kiểm tra file cũ có tồn tại trong folder chưa
-        query = f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false"
-        existing = svc.files().list(q=query, fields="files(id)").execute().get("files", [])
+    # 1) tìm file trùng tên trong đúng folder
+    q = "name = '{}' and '{}' in parents and trashed = false".format(
+        file_name.replace("'", r"\'"), drive_folder_id
+    )
+    res = service.files().list(q=q, fields="files(id, name)").execute()
+    exists = res.get("files", [])
+    media = MediaFileUpload(local_path, mimetype="application/octet-stream", resumable=True)
 
-        media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
-
-        if existing:
-            # ✅ Nếu có file cũ → ghi đè (update)
-            file_id = existing[0]['id']
-            svc.files().update(fileId=file_id, media_body=media).execute()
-            logging.info(f"🟡 Đã cập nhật cache {file_name} lên Drive (update).")
-        else:
-            # ✅ Nếu chưa có → tạo mới
-            meta = {'name': file_name, 'parents': [FOLDER_ID]}
-            svc.files().create(body=meta, media_body=media, fields='id').execute()
-            logging.info(f"🟢 Đã upload cache {file_name} lên Drive (create).")
-
-    except Exception as e:
-        logging.warning(f"[CACHE] save failed {os.path.basename(local_path)}: {e}")
+    if exists:
+        file_id = exists[0]["id"]
+        service.files().update(
+            fileId=file_id,
+            media_body=media
+        ).execute()
+        return f"Đã **cập nhật (overwrite)** {file_name} lên Drive."
+    else:
+        service.files().create(
+            body={"name": file_name, "parents": [drive_folder_id]},
+            media_body=media,
+            fields="id"
+        ).execute()
+        return f"Đã **tạo mới** {file_name} lên Drive."
 
 
 def download_from_drive(symbol: str, interval: str) -> str | None:
