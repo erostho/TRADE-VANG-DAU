@@ -2033,12 +2033,14 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         bias = strong_trend(hist)
         regime = "TREND" if bias in ("LONG","SHORT") else "RANGE"
         confidence = 1.0
-        # Lọc theo toggle
-        if (regime == "RANGE" and not ALLOW_RANGE_IN_BACKTEST) or (confidence < CONF_MIN_BACKTEST):
-            continue
-        # Chỉ áp choppy filter cho TREND (nếu có)
-        # if regime == "TREND" and _bt_sideway_block_offline(...): continue
-        # ✅ RANGE: tự xác định side để có LONG/SHORT cho SL/TP
+        
+        # 👉 TÍNH KELTNER TRƯỚC ĐÃ
+        try:
+            km, kup, kdn = keltner_mid(hist, 20, atr_mult=1.0)
+        except Exception:
+            km = kup = kdn = np.nan
+        
+        # 👉 RANGE: tự xác định side theo biên
         if regime == "RANGE":
             px = float(hist["close"].iloc[-1])
             if not np.isnan(kup) and px >= kup:
@@ -2046,10 +2048,14 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
             elif not np.isnan(kdn) and px <= kdn:
                 bias = "LONG"
             else:
-                # chưa chạm biên – không trade RANGE ở nến này
-                continue    
-        entry = float(hist["close"].iloc[-1])  # close của nến -2
-        atrv  = atr(hist, 14)
+                # chưa chạm biên → bỏ qua nến này
+                continue
+        
+        # (nếu muốn) choppy filter CHỈ cho TREND
+        # if regime == "TREND" and _bt_sideway_block_offline(...): continue
+        
+        entry = float(hist["close"].iloc[-1])
+        atrv = atr(hist, 14)
         swing_hi, swing_lo = swing_levels(hist, 20)
 
         # Keltner/Donchian trên chính tf
