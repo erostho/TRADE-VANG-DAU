@@ -2102,21 +2102,24 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         expR = sum((r["R"] if r["outcome"] in ("TP","Tp") else (-1.0 if r["outcome"] in ("SL","Sl") else 0.0)) for r in subrows) / max(1, trades)
         return {"trades": trades, "win": wins, "loss": losses, "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}  
     trend_rows = [r for r in rows if r.get("regime") == "TREND"]
-    range_rows = [r for r in rows if r.get("regime") == "RANGE"] 
+    range_rows = [r for r in rows if r.get("regime") == "RANGE"]
+    
     trend_stat = _stats(trend_rows)
     range_stat = _stats(range_rows)
-
-    trades = wins + losses + tout
-    winrate = (wins / max(1, wins + losses)) * 100.0 if (wins+losses)>0 else 0.0
-    expR = total_R / max(1, trades)
-    res["trend"] = trend_stat
-    res["range"] = range_stat
-    return {
+    
+    trades  = wins + losses + tout
+    winrate = (wins / max(1, wins + losses)) * 100.0 if (wins + losses) > 0 else 0.0
+    expR    = total_R / max(1, trades)
+    
+    res = {
         "symbol": name,
         "trades": trades, "win": wins, "loss": losses, "timeout": tout,
-        "winrate": round(winrate,1), "expR": round(expR,3),
-        "by_regime": {"TREND": trend_stat, "RANGE": range_stat}
+        "winrate": round(winrate, 1), "expR": round(expR, 3),
+        "trend": trend_stat,         # ✅ có số liệu TREND
+        "range": range_stat,         # ✅ có số liệu RANGE
     }
+    
+    return res
 
 def backtest_90d_offline():
     MAIN_TF = os.getenv("MAIN_TF", "2h")
