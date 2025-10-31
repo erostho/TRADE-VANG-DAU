@@ -1777,7 +1777,7 @@ def _safe_name(x: str) -> str:
     return x
 
 def _cache_file(symbol: str, interval: str) -> str:
-    return os.path.join(CANDLE_CACHE_DIR, f"{_safe_name(symbol)}__{interval}.parquet")
+    return os.path.join(CANDLE_CACHE_DIR, f"{_safe_name(symbol)}_{interval}.parquet")
 
 def save_candles_to_disk(symbol: str, interval: str, df: pd.DataFrame):
     """Gộp incremental và lưu Parquet; gọi ngay MỖI LẦN fetch_candles trả về df."""
