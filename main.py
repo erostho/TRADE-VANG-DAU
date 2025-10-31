@@ -1841,41 +1841,43 @@ def _drive_service():
     return build('drive', 'v3', credentials=creds)
 
 def upload_to_drive(local_path: str):
+    """Upload/Update file cache vào Google Drive (thư mục từ GOOGLE_DRIVE_FOLDER_ID)."""
+    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
+    if not folder_id:
+        logging.warning("⚠️ Chưa có GOOGLE_DRIVE_FOLDER_ID → bỏ qua upload")
+        return
+    if not os.path.exists(local_path):
+        logging.error(f"❌ Upload cache thất bại: không thấy file {local_path}")
+        return
+
+    creds = _drive_creds_from_env()
+    if not creds:
+        return
+
+    service = build("drive", "v3", credentials=creds)
+    file_name = os.path.basename(local_path)
+    mime_type = mimetypes.guess_type(local_path)[0] or "application/octet-stream"
+
+    # Tìm xem file đã có trong folder chưa → nếu có thì update, không thì create
+    q = f"name = '{file_name}' and '{folder_id}' in parents and trashed = false"
     try:
-        if not os.path.exists(local_path):
-            logging.warning(f"[CACHE] Local file không tồn tại: {local_path}")
-            return
-
-        file_name = os.path.basename(local_path)
-        service = _drive_service()
-
-        # 🔍 Tìm file trùng tên trong folder
-        query = f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false"
-        res = service.files().list(q=query, fields="files(id, name)").execute()
+        res = service.files().list(q=q, spaces="drive", fields="files(id,name)").execute()
         files = res.get("files", [])
-
-        media = MediaFileUpload(local_path, mimetype='application/octet-stream', resumable=True)
-
+        media = MediaFileUpload(local_path, mimetype=mime_type, resumable=True)
         if files:
-            file_id = files[0]['id']
+            file_id = files[0]["id"]
             service.files().update(fileId=file_id, media_body=media).execute()
-            logging.info(f"🟡 Đã cập nhật cache {file_name} lên Drive (update).")
+            logging.info(f"✅ Đã cập nhật cache {file_name} lên Drive (update).")
         else:
-            meta = {'name': file_name, 'parents': [FOLDER_ID]}
-            service.files().create(body=meta, media_body=media, fields='id').execute()
-            logging.info(f"🟢 Đã upload cache {file_name} lên Drive (create).")
-
-        # ✅ Xác thực lại file tồn tại
-        time.sleep(1)
-        check = service.files().list(
-            q=f"name='{file_name}' and '{FOLDER_ID}' in parents and trashed=false",
-            fields="files(id)"
-        ).execute().get("files", [])
-        if not check:
-            logging.warning(f"⚠️ Không thấy file sau khi sync: {file_name}")
-
+            service.files().create(
+                body={"name": file_name, "parents": [folder_id]},
+                media_body=media,
+                fields="id",
+            ).execute()
+            logging.info(f"✅ Đã upload cache {file_name} lên Drive (create).")
     except Exception as e:
-        logging.warning(f"[CACHE] save failed {os.path.basename(local_path)}: {e}")
+        logging.error(f"❌ Upload cache thất bại: {e}")
+
 
 def download_from_drive(symbol: str, interval: str) -> str | None:
     """Kéo toàn bộ folder cache từ Drive về /tmp rồi lấy đúng file cần.
