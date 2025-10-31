@@ -2061,7 +2061,7 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         rr = abs(tp - entry) / R
         if rr < 1.2:  # nới lỏng để có đủ trade
             continue
-
+        
         fut = df_main.iloc[i+1:]
         if len(fut) == 0:
             break
@@ -2075,13 +2075,13 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         else:
             tout += 1; outR = 0.0
         total_R += outR
-
+        regime = "TREND" if str(bias).upper() in ("LONG", "SHORT") else "RANGE"
         rows.append({
             "symbol": name, "tf": tf,
             "signal_time": hist["datetime"].iloc[-1].isoformat(),
             "side": bias, "entry": entry, "fill": fill, "sl": sl, "tp": tp,
             "regime": regime, "confidence": confidence,
-            "R": round(outR,3), "bars_to_outcome": bars, "outcome": outcome
+            "R": round(outR,3), "bars_to_outcome": bars, "outcome": outcome, "regime": regime,
         })
 
     # ghi CSV (append)
@@ -2103,8 +2103,7 @@ def backtest_90d_offline_for_symbol(name: str, symbol: str, main_tf: str = None)
         expR = sum((r["R"] if r["outcome"] in ("TP","Tp") else (-1.0 if r["outcome"] in ("SL","Sl") else 0.0))
                    for r in subrows) / max(1, trades)
         return {"trades": trades, "win": wins, "loss": losses,
-                "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}
-    
+                "timeout": tout, "winrate": round(winrate,1), "expR": round(expR,3)}  
     trend_rows = [r for r in rows if r.get("regime") == "TREND"]
     range_rows = [r for r in rows if r.get("regime") == "RANGE"] 
     trend_stat = _stats(trend_rows)
@@ -2133,7 +2132,16 @@ def backtest_90d_offline():
 
     lines = [f"📊 Backtest 90d (OFFLINE, {MAIN_TF}, no API):"]
     for r in summary:
-        lines.append(f"- {r['symbol']}: {r['trades']} trades | W:{r['win']} L:{r['loss']} T:{r['timeout']} | Winrate {r['winrate']}% | ExpR {r['expR']}")
+        lines.append(
+            f"- {r['symbol']}: {r['trades']} trades | W:{r['win']} L:{r['loss']} T:{r['timeout']} | "
+            f"Winrate {r['winrate']}% | ExpR {r['expR']}"
+        )
+        t = r.get("trend")
+        if t:
+            lines.append(f"   • TREND : {t['trades']} | W:{t['win']} L:{t['loss']} T:{t['timeout']} | Win {t['winrate']}% | ExpR {t['expR']}")
+        g = r.get("range")
+        if g:
+            lines.append(f"   • RANGE : {g['trades']} | W:{g['win']} L:{g['loss']} T:{g['timeout']} | Win {g['winrate']}% | ExpR {g['expR']}")
     msg = "\n".join(lines)
     logging.info(msg)
     try:
