@@ -64,7 +64,7 @@ symbols = {
     "Ethereum": "ETH/USD",
     "XAU/USD (Gold)": "XAU/USD",
     "WTI Oil": "CL",
-    "XAG/USD (Silver)": "XAG/USD",
+    #"XAG/USD (Silver)": "XAG/USD",
     #"EUR/USD": "EUR/USD",
     #"AUD/USD": "AUD/USD",
 }
